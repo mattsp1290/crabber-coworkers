@@ -1,6 +1,6 @@
 use crate::config::{
     CoworkerDefinition,
-    constants::{MODEL_ID, PROVIDER_ID},
+    constants::{API_KEY_ENV, MODEL_ID, PROVIDER_ID},
 };
 use crabber::{
     Agent, AgentConfig, BuildError, PermissionDecision, Selection, StaticPolicy,
@@ -33,6 +33,7 @@ pub fn build_agent(
         .config(AgentConfig {
             selection,
             workspace_id: def.id.clone(),
+            // No filesystem tools exist; revisit this root before adding them.
             directory: ".".into(),
             title: def.name.clone(),
             system_prompt: Some(system_prompt(def)),
@@ -54,8 +55,11 @@ pub fn opencode_go_resolver(base_url: Option<&str>, api_key: Option<&str>) -> Ar
 }
 
 #[must_use]
-pub fn opencode_go_resolver_from_env() -> Arc<dyn Resolver> {
-    opencode_go_resolver(None, None)
+pub fn opencode_go_resolver_from_env() -> Option<Arc<dyn Resolver>> {
+    let key = std::env::var(API_KEY_ENV)
+        .ok()
+        .filter(|key| !key.trim().is_empty())?;
+    Some(opencode_go_resolver(None, Some(&key)))
 }
 
 #[must_use]

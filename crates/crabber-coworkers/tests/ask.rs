@@ -128,7 +128,7 @@ async fn provider_failure_is_redacted() {
     )
     .await
     .unwrap_err();
-    assert!(matches!(error, AskError::Run | AskError::NotCompleted));
+    assert_eq!(error, AskError::Run);
     assert!(!error.to_string().contains("secret-marker"));
 }
 #[tokio::test]

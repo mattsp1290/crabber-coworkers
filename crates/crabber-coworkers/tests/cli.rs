@@ -28,6 +28,10 @@ fn invalid_config() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(output.stdout, b"");
+    assert_eq!(
+        output.stderr,
+        b"invalid configuration JSON at line 1, column 2 (data)\n"
+    );
 }
 #[test]
 fn missing_config() {
@@ -91,6 +95,19 @@ fn empty_api_key() {
         .arg(example())
         .args(["scout", "hi"])
         .env("OPENCODE_GO_API_KEY", "")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.stderr, b"OPENCODE_GO_API_KEY is not set\n");
+}
+
+#[test]
+fn whitespace_api_key() {
+    let output = binary()
+        .args(["ask", "--config"])
+        .arg(example())
+        .args(["scout", "hi"])
+        .env("OPENCODE_GO_API_KEY", "  ")
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));

@@ -37,9 +37,8 @@ pub enum Command {
 pub async fn run(cli: Cli) -> i32 {
     execute(
         cli,
-        bridge::opencode_go_resolver_from_env(),
+        Provider::FromEnv,
         bridge::production_selection(),
-        true,
         &mut io::stdout(),
         &mut io::stderr(),
     )
@@ -53,7 +52,7 @@ pub async fn run_with(
     out: &mut (dyn Write + Send),
     err: &mut (dyn Write + Send),
 ) -> i32 {
-    execute(cli, resolver, selection, false, out, err).await
+    execute(cli, Provider::Injected(resolver), selection, out, err).await
 }
 
 fn fail(err: &mut (dyn Write + Send), message: &str, code: i32) -> i32 {
@@ -61,11 +60,15 @@ fn fail(err: &mut (dyn Write + Send), message: &str, code: i32) -> i32 {
     code
 }
 
+enum Provider {
+    FromEnv,
+    Injected(Arc<dyn Resolver>),
+}
+
 async fn execute(
     cli: Cli,
-    resolver: Arc<dyn Resolver>,
+    provider: Provider,
     selection: Selection,
-    require_key: bool,
     out: &mut (dyn Write + Send),
     err: &mut (dyn Write + Send),
 ) -> i32 {
@@ -96,11 +99,13 @@ async fn execute(
                 Ok(def) => def,
                 Err(error) => return fail(err, &error.to_string(), error.exit_code()),
             };
-            if require_key
-                && std::env::var("OPENCODE_GO_API_KEY").map_or(true, |key| key.is_empty())
-            {
-                return fail(err, "OPENCODE_GO_API_KEY is not set", 2);
-            }
+            let resolver = match provider {
+                Provider::Injected(resolver) => resolver,
+                Provider::FromEnv => match bridge::opencode_go_resolver_from_env() {
+                    Some(resolver) => resolver,
+                    None => return fail(err, "OPENCODE_GO_API_KEY is not set", 2),
+                },
+            };
             match ask(
                 def,
                 &prompt,

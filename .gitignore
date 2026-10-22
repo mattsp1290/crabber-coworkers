@@ -25,6 +25,7 @@ rustc-ice-*.txt
 
 .agents/plans/
 .agents/reviews/
-reviews/
-config.json
+/reviews/
+/config.json
 .env
+.env.*

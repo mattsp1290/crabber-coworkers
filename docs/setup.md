@@ -24,8 +24,8 @@ cargo xtask check
 | --- | --- | --- |
 | `coworkers` | Required | 1–32 entries |
 | `coworkers[].id` | Required | Unique; 1–64 bytes; lowercase ASCII letters and digits in groups separated by single hyphens |
-| `coworkers[].name` | Required | Nonblank after trimming; at most 100 bytes |
-| `coworkers[].role` | Required | Nonblank after trimming; at most 200 bytes |
+| `coworkers[].name` | Required | Nonblank after trimming; at most 100 bytes; no control characters |
+| `coworkers[].role` | Required | Nonblank after trimming; at most 200 bytes; no control characters |
 | `coworkers[].instructions` | Required | Nonblank after trimming; at most 16,384 bytes |
 | `limits` | Optional; defaults below | Object containing only the following fields |
 | `limits.max_prompt_bytes` | 32,768 | 1–1,048,576 bytes |
@@ -59,3 +59,7 @@ Config and request validation happen before the API-key check or any model reque
 The tool never logs credential values, prompt text, answer text, or raw provider errors. Only the requested committed answer goes to stdout. Errors contain fixed messages or redacted configuration paths and rule names.
 
 Tests need no credentials or database. If a local proxy is set, set `NO_PROXY=127.0.0.1,localhost` for direct test runs; `cargo xtask check` sets it on its test subprocess. The gate checks formatting, Clippy, workspace tests, the release build, the resolved crabber pin, and the example config, in that order. All dependency resolution is locked.
+
+`limits.model_turn_seconds` bounds model admission, all provider retries, and reading the committed answer together. The standalone CLI exits after a timeout. The pinned facade consumes its run handle in `done()`, so dropping that wait does not explicitly interrupt the background run; long-running callers should account for this lifecycle limitation before reusing this entry point.
+
+Prompts are currently a command-line argument. Operating-system argument limits can be smaller than `max_prompt_bytes`; for example, Linux commonly limits one argument to about 128 KiB. Such an oversized argument is rejected by the OS before the CLI runs.

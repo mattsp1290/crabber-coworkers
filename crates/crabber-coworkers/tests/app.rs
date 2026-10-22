@@ -67,7 +67,7 @@ async fn redacted_failure() {
         1
     );
     assert_eq!(out, b"");
-    assert!(err == b"model run failed\n" || err == b"model run did not complete\n");
+    assert_eq!(err, b"model run failed\n");
 }
 #[tokio::test]
 async fn configured_timeout() {

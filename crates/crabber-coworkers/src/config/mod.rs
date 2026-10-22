@@ -1,5 +1,8 @@
 pub mod constants;
-use constants::{MAX_CONFIG_BYTES, MAX_INSTRUCTIONS_BYTES};
+use constants::{
+    DEFAULT_PROMPT_BYTES, DEFAULT_TURN_SECONDS, MAX_CONFIG_BYTES, MAX_COWORKERS, MAX_ID_BYTES,
+    MAX_INSTRUCTIONS_BYTES, MAX_NAME_BYTES, MAX_PROMPT_BYTES, MAX_ROLE_BYTES, MAX_TURN_SECONDS,
+};
 use serde::Deserialize;
 use std::{collections::HashSet, fs::File, io::Read, path::Path};
 
@@ -30,8 +33,8 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_prompt_bytes: 32_768,
-            model_turn_seconds: 120,
+            max_prompt_bytes: DEFAULT_PROMPT_BYTES,
+            model_turn_seconds: DEFAULT_TURN_SECONDS,
         }
     }
 }
@@ -48,20 +51,27 @@ impl Config {
 
     fn validate(&self) -> Result<(), ConfigError> {
         let mut errors = Vec::new();
-        if !(1..=32).contains(&self.coworkers.len()) {
-            errors.push("coworkers must contain 1–32 entries".into());
+        if !(1..=MAX_COWORKERS).contains(&self.coworkers.len()) {
+            errors.push(format!("coworkers must contain 1–{MAX_COWORKERS} entries"));
         }
         let mut ids = HashSet::new();
         for (i, def) in self.coworkers.iter().enumerate() {
-            if def.id.len() > 64 || !valid_id(&def.id) {
-                errors.push(format!("coworkers[{i}].id must be lowercase alphanumeric groups separated by single hyphens, at most 64 bytes"));
+            if def.id.len() > MAX_ID_BYTES || !valid_id(&def.id) {
+                errors.push(format!("coworkers[{i}].id must be lowercase alphanumeric groups separated by single hyphens, at most {MAX_ID_BYTES} bytes"));
             }
             if !ids.insert(&def.id) {
                 errors.push(format!("coworkers[{i}].id must be unique"));
             }
+            for (field, value) in [("name", &def.name), ("role", &def.role)] {
+                if value.chars().any(char::is_control) {
+                    errors.push(format!(
+                        "coworkers[{i}].{field} must not contain control characters"
+                    ));
+                }
+            }
             for (field, value, cap) in [
-                ("name", &def.name, 100),
-                ("role", &def.role, 200),
+                ("name", &def.name, MAX_NAME_BYTES),
+                ("role", &def.role, MAX_ROLE_BYTES),
                 ("instructions", &def.instructions, MAX_INSTRUCTIONS_BYTES),
             ] {
                 if value.trim().is_empty() || value.len() > cap {
@@ -71,11 +81,15 @@ impl Config {
                 }
             }
         }
-        if !(1..=1_048_576).contains(&self.limits.max_prompt_bytes) {
-            errors.push("limits.max_prompt_bytes must be in 1..=1048576".into());
+        if !(1..=MAX_PROMPT_BYTES).contains(&self.limits.max_prompt_bytes) {
+            errors.push(format!(
+                "limits.max_prompt_bytes must be in 1..={MAX_PROMPT_BYTES}"
+            ));
         }
-        if !(1..=3_600).contains(&self.limits.model_turn_seconds) {
-            errors.push("limits.model_turn_seconds must be in 1..=3600".into());
+        if !(1..=MAX_TURN_SECONDS).contains(&self.limits.model_turn_seconds) {
+            errors.push(format!(
+                "limits.model_turn_seconds must be in 1..={MAX_TURN_SECONDS}"
+            ));
         }
         if errors.is_empty() {
             Ok(())
@@ -257,5 +271,20 @@ mod tests {
             load(file.path()).unwrap_err().to_string(),
             "configuration file must be UTF-8"
         );
+    }
+    #[test]
+    fn single_line_identity_fields() {
+        for field in ["name", "role"] {
+            for value in ["A\tB", "A\nB", "A\rB", "A\u{1b}B"] {
+                let mut v = example();
+                v["coworkers"][0][field] = json!(value);
+                assert!(parse(&v).unwrap_err().to_string().contains(&format!(
+                    "coworkers[0].{field} must not contain control characters"
+                )));
+            }
+        }
+        let mut v = example();
+        v["coworkers"][0]["instructions"] = json!("First line.\nSecond line.");
+        assert!(parse(&v).is_ok());
     }
 }
