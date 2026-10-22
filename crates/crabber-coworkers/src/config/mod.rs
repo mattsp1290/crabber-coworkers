@@ -225,7 +225,12 @@ mod tests {
     #[test]
     fn long_instructions() {
         let mut v = example();
-        v["coworkers"][0]["instructions"] = json!("secret-marker".repeat(1261));
+        let mut instructions = "secret-marker".to_owned();
+        instructions.push_str(&"x".repeat(MAX_INSTRUCTIONS_BYTES - instructions.len()));
+        v["coworkers"][0]["instructions"] = json!(instructions);
+        assert!(parse(&v).is_ok());
+        instructions.push('x');
+        v["coworkers"][0]["instructions"] = json!(instructions);
         let e = parse(&v).unwrap_err().to_string();
         assert!(e.contains("instructions"));
         assert!(!e.contains("secret-marker"));
