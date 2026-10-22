@@ -1,0 +1,22 @@
+[package]
+name = "crabber-coworkers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+crabber = { git = "ssh://git@github.com/mattsp1290/crabber.git", rev = "883189465397b2fd326a6ef358c8a2fbd39fbec8", features = ["opencode-go"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+async-trait = "0.1"
+tempfile = "3"
+futures = "0.3"
+tokio = { version = "1", features = ["net", "io-util"] }

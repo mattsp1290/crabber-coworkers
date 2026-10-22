@@ -1,0 +1,10 @@
+pub const MAX_CONFIG_BYTES: u64 = 262_144;
+pub const MAX_INSTRUCTIONS_BYTES: usize = 16_384;
+pub const MAX_COWORKERS: usize = 32;
+pub const MAX_ID_BYTES: usize = 64;
+pub const MAX_NAME_BYTES: usize = 100;
+pub const MAX_ROLE_BYTES: usize = 200;
+pub const MAX_PROMPT_BYTES: usize = 1_048_576;
+pub const MAX_TURN_SECONDS: u64 = 3_600;
+pub const DEFAULT_PROMPT_BYTES: usize = 32_768;
+pub const DEFAULT_TURN_SECONDS: u64 = 120;
