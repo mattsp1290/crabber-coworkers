@@ -1,0 +1,8 @@
+- Rust 2024 workspace. Run `cargo xtask check` before handing off a work package.
+- Pin crabber in exactly two places: `crates/crabber-coworkers/Cargo.toml` and `xtask/src/pins.rs`. Keep them equal. When crabber-tools or crabber-extensions are added, keep the pin equal to theirs.
+- Never commit a crabber path override or a `[patch]` section.
+- Import crabber only through the `crabber` facade crate.
+- Tests must run without credentials. Inject providers through the library entry points.
+- Credentials come only from the environment. Never print or log credentials, prompt text, answer text, or raw provider errors. The requested final answer is written only to CLI stdout.
+- Keep `.agents/plans/`, `.agents/reviews/` and `reviews/` local and uncommitted. Commit `.agents/next-milestone.json`.
+- Track work in `bn`.

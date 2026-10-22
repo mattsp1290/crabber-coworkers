@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "project": {
+    "id": "crabber-coworkers",
+    "name": "Crabber Coworkers",
+    "vision": "Give a person always-on AI coworkers (Dots) with their own workspace, built on the Crabber Rust runtime instead of CopilotKit/TypeScript.",
+    "repository_identity": {
+      "kind": "remote-url",
+      "value": "https://github.com/mattsp1290/crabber-coworkers"
+    }
+  },
+  "comparators": [
+    {
+      "name": "OpenDots",
+      "official_sources": [
+        "https://github.com/CopilotKit/OpenDots",
+        "https://www.copilotkit.ai/opendots"
+      ],
+      "relevance": "The product this repository ports: persistent specialist Dots with Spaces, per-Dot computers, review-before-save, and Slack."
+    },
+    {
+      "name": "OpenBot",
+      "official_sources": [
+        "https://github.com/CopilotKit/OpenBot",
+        "https://www.copilotkit.ai/openbot"
+      ],
+      "relevance": "Shows how OpenDots gives each coworker its own persistent computer with permissioned, recorded actions."
+    },
+    {
+      "name": "OpenTag",
+      "official_sources": [
+        "https://github.com/CopilotKit/OpenTag"
+      ],
+      "relevance": "The Slack integration pattern OpenDots follows: allowlisted workspace/user, selected specialist, in-thread replies."
+    },
+    {
+      "name": "OpenAI dots",
+      "official_sources": [
+        "https://openai.com/index/introducing-dots/",
+        "https://help.openai.com/en/articles/20001530-getting-started-with-your-dot"
+      ],
+      "relevance": "A commercial always-on coworker reachable from ChatGPT and Slack, with its own computer and approval rules."
+    },
+    {
+      "name": "Claude Duet",
+      "official_sources": [
+        "https://claude.com/product/claude-duet",
+        "https://claude.com/resources/articles/claude-duet"
+      ],
+      "relevance": "A proactive agent on its own VM that drafts freely but asks before external effects."
+    },
+    {
+      "name": "Grok Bot",
+      "official_sources": [
+        "https://x.ai/bot",
+        "https://docs.x.ai/grok-bot/overview"
+      ],
+      "relevance": "Multiple persistent teammates with their own computers, memory, team sharing, and group-chat handoff."
+    }
+  ],
+  "evaluation_lenses": [
+    {
+      "name": "Persistent identity",
+      "question": "Does a coworker keep its name, role, instructions, and history across restarts?"
+    },
+    {
+      "name": "Channel reach",
+      "question": "Can a user reach the coworker where they already work (Slack, Discord, web)?"
+    },
+    {
+      "name": "Bounded autonomy",
+      "question": "Are the coworker's tools and actions permissioned, with human approval for risky ones?"
+    },
+    {
+      "name": "Own workspace",
+      "question": "Does each coworker get an isolated, persistent workspace or computer for its files and tools?"
+    }
+  ],
+  "acceptance_journey": "A user mentions a coworker in Slack, it answers in-thread using its configured role, and history survives restart.",
+  "non_goals": [
+    "No dependency on CopilotKit Intelligence or other hosted agent services.",
+    "No realtime voice or calls.",
+    "No native mobile app.",
+    "Port OpenDots behavior, not its TypeScript source."
+  ],
+  "ecosystem": {
+    "related_repositories": [
+      {
+        "id": "crabber",
+        "path_hint": "${HOME}/git/crabber",
+        "role": "Embeddable Rust agent runtime that coworkers run on."
+      },
+      {
+        "id": "crabber-channels",
+        "path_hint": "${HOME}/git/crabber-channels",
+        "role": "Buddy repo: durable Discord and Slack conversation host for Crabber."
+      },
+      {
+        "id": "crabber-tools",
+        "path_hint": "${HOME}/git/crabber-tools",
+        "role": "Workspace coding tools catalog (file, search, shell, patch, fetch) for Crabber agents."
+      },
+      {
+        "id": "crabber-extensions",
+        "path_hint": "${HOME}/git/crabber-extensions",
+        "role": "Trusted native Crabber extensions: workspace instructions, ask-user, delegated tasks, web search, command enforcement, background jobs."
+      },
+      {
+        "id": "borb",
+        "path_hint": "${HOME}/git/borb",
+        "role": "Persistent agent sandboxes that could serve as each coworker's computer."
+      }
+    ]
+  }
+}
