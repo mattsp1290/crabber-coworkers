@@ -52,3 +52,47 @@ fn oversized_config() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(output.stderr, b"configuration file exceeds 262144 bytes\n");
 }
+
+#[test]
+fn missing_api_key() {
+    let output = binary()
+        .args(["ask", "--config"])
+        .arg(example())
+        .args(["scout", "hi"])
+        .env_remove("OPENCODE_GO_API_KEY")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.stderr, b"OPENCODE_GO_API_KEY is not set\n");
+    assert_eq!(output.stdout, b"");
+}
+#[test]
+fn validation_precedes_key_check() {
+    for key in [None, Some("placeholder-not-a-key")] {
+        let mut command = binary();
+        command
+            .args(["ask", "--config"])
+            .arg(example())
+            .args(["nobody", "hi"])
+            .env_remove("OPENCODE_GO_API_KEY");
+        if let Some(key) = key {
+            command.env("OPENCODE_GO_API_KEY", key);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.stderr, b"unknown coworker\n");
+        assert_eq!(output.stdout, b"");
+    }
+}
+#[test]
+fn empty_api_key() {
+    let output = binary()
+        .args(["ask", "--config"])
+        .arg(example())
+        .args(["scout", "hi"])
+        .env("OPENCODE_GO_API_KEY", "")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.stderr, b"OPENCODE_GO_API_KEY is not set\n");
+}
