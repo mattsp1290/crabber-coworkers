@@ -53,6 +53,16 @@ fn check() -> Result<(), String> {
     if !verify_crabber_source(&metadata, pins::CRABBER_REV) {
         return Err(pin_error.into());
     }
+    let status = Command::new(
+        std::path::Path::new("target/release/crabber-coworkers")
+            .with_extension(std::env::consts::EXE_EXTENSION),
+    )
+    .args(["check-config", "--config", "config.example.json"])
+    .status()
+    .map_err(|_| "example config check")?;
+    if !status.success() {
+        return Err("example config check".into());
+    }
     Ok(())
 }
 
