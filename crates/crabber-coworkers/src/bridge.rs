@@ -1,7 +1,8 @@
-use crate::config::{
-    CoworkerDefinition,
-    constants::{API_KEY_ENV, MODEL_ID, PROVIDER_ID},
-};
+pub const PROVIDER_ID: &str = "opencode-go";
+pub const MODEL_ID: &str = "deepseek-v4-flash";
+pub const API_KEY_ENV: &str = "OPENCODE_GO_API_KEY";
+
+use crate::config::CoworkerDefinition;
 use crabber::{
     Agent, AgentConfig, BuildError, PermissionDecision, Selection, StaticPolicy,
     providers::{HttpAdapter, HttpResolver, Protocol, Resolver},
@@ -43,13 +44,10 @@ pub fn build_agent(
 }
 
 #[must_use]
-pub fn opencode_go_resolver(base_url: Option<&str>, api_key: Option<&str>) -> Arc<dyn Resolver> {
-    let mut adapter = HttpAdapter::opencode_go(Protocol::ChatCompletions);
+pub fn opencode_go_resolver(api_key: &str, base_url: Option<&str>) -> Arc<dyn Resolver> {
+    let mut adapter = HttpAdapter::opencode_go(Protocol::ChatCompletions).with_api_key(api_key);
     if let Some(url) = base_url {
         adapter = adapter.with_base_url(url);
-    }
-    if let Some(key) = api_key {
-        adapter = adapter.with_api_key(key);
     }
     Arc::new(HttpResolver::new().with_adapter(adapter))
 }
@@ -59,7 +57,7 @@ pub fn opencode_go_resolver_from_env() -> Option<Arc<dyn Resolver>> {
     let key = std::env::var(API_KEY_ENV)
         .ok()
         .filter(|key| !key.trim().is_empty())?;
-    Some(opencode_go_resolver(None, Some(&key)))
+    Some(opencode_go_resolver(&key, None))
 }
 
 #[must_use]

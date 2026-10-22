@@ -1,8 +1,9 @@
+#[path = "common/example.rs"]
+mod example;
 const SSE_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"pong\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
 use crabber_coworkers::{
     ask::ask,
     bridge::{opencode_go_resolver, production_selection},
-    config,
 };
 use std::{sync::Arc, time::Duration};
 use tokio::{
@@ -62,11 +63,8 @@ async fn opencode_go_request_shape() {
             socket.write_all(SSE_RESPONSE).await.unwrap();
             socket.shutdown().await.unwrap();
         });
-        let config = config::load(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.example.json"),
-        )
-        .unwrap();
-        let resolver = opencode_go_resolver(Some(&url), Some("test-key"));
+        let config = example::config();
+        let resolver = opencode_go_resolver("test-key", Some(&url));
         let answer = ask(
             config.coworker("scout").unwrap(),
             "ping",

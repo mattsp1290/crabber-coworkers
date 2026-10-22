@@ -56,24 +56,31 @@ impl Config {
         }
         let mut ids = HashSet::new();
         for (i, def) in self.coworkers.iter().enumerate() {
-            if def.id.len() > MAX_ID_BYTES || !valid_id(&def.id) {
+            if !valid_id(&def.id) {
                 errors.push(format!("coworkers[{i}].id must be lowercase alphanumeric groups separated by single hyphens, at most {MAX_ID_BYTES} bytes"));
             }
             if !ids.insert(&def.id) {
                 errors.push(format!("coworkers[{i}].id must be unique"));
             }
-            for (field, value) in [("name", &def.name), ("role", &def.role)] {
-                if value.chars().any(char::is_control) {
+            let fields = [
+                ("name", &def.name, MAX_NAME_BYTES, true),
+                ("role", &def.role, MAX_ROLE_BYTES, true),
+                (
+                    "instructions",
+                    &def.instructions,
+                    MAX_INSTRUCTIONS_BYTES,
+                    false,
+                ),
+            ];
+            // Keep control-character diagnostics before length/blankness diagnostics.
+            for (field, value, _, single_line) in &fields {
+                if *single_line && value.chars().any(char::is_control) {
                     errors.push(format!(
                         "coworkers[{i}].{field} must not contain control characters"
                     ));
                 }
             }
-            for (field, value, cap) in [
-                ("name", &def.name, MAX_NAME_BYTES),
-                ("role", &def.role, MAX_ROLE_BYTES),
-                ("instructions", &def.instructions, MAX_INSTRUCTIONS_BYTES),
-            ] {
+            for (field, value, cap, _) in fields {
                 if value.trim().is_empty() || value.len() > cap {
                     errors.push(format!(
                         "coworkers[{i}].{field} must be non-empty and at most {cap} bytes"
@@ -100,12 +107,13 @@ impl Config {
 }
 
 fn valid_id(id: &str) -> bool {
-    id.split('-').all(|group| {
-        !group.is_empty()
-            && group
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-    })
+    id.len() <= MAX_ID_BYTES
+        && id.split('-').all(|group| {
+            !group.is_empty()
+                && group
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        })
 }
 
 /// Load and strictly validate a bounded JSON configuration.

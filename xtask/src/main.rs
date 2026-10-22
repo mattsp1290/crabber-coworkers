@@ -22,68 +22,77 @@ fn workspace_root() -> &'static std::path::Path {
         .expect("xtask is a workspace child")
 }
 
-fn cargo_command() -> Command {
+fn cargo(args: &[&str]) -> Command {
     let mut command = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-    command.current_dir(workspace_root());
+    command.current_dir(workspace_root()).args(args);
     command
 }
 
-fn cargo(args: &[&str]) -> Result<(), String> {
-    let mut command = cargo_command();
-    command.args(args);
-    if args.first() == Some(&"test") {
-        let existing = std::env::var("NO_PROXY")
-            .or_else(|_| std::env::var("no_proxy"))
-            .unwrap_or_default();
-        command.env("NO_PROXY", format!("{existing},127.0.0.1,localhost"));
-    }
+fn run(step: &str, command: &mut Command) -> Result<(), String> {
     match command.status() {
         Ok(status) if status.success() => Ok(()),
-        _ => Err(format!("cargo {}", args.join(" "))),
+        _ => Err(step.to_owned()),
     }
 }
 
-fn check() -> Result<(), String> {
-    cargo(&["fmt", "--all", "--check"])?;
-    cargo(&[
-        "clippy",
-        "--workspace",
-        "--all-targets",
-        "--locked",
-        "--",
-        "-D",
-        "warnings",
-    ])?;
-    cargo(&["test", "--workspace", "--locked"])?;
-    cargo(&["build", "-p", "crabber-coworkers", "--release", "--locked"])?;
-    let pin_error = "crabber dependency pin differs from xtask/src/pins.rs";
-    let output = cargo_command()
-        .args(["metadata", "--locked", "--format-version", "1"])
+fn no_proxy() -> String {
+    let existing = std::env::var("NO_PROXY")
+        .or_else(|_| std::env::var("no_proxy"))
+        .unwrap_or_default();
+    format!("{existing},127.0.0.1,localhost")
+}
+
+fn cargo_metadata() -> Result<Value, String> {
+    let step = "cargo metadata --locked";
+    let output = cargo(&["metadata", "--locked", "--format-version", "1"])
         .output()
-        .map_err(|_| "cargo metadata --locked")?;
+        .map_err(|_| step)?;
     if !output.status.success() {
-        return Err("cargo metadata --locked".into());
+        return Err(step.into());
     }
-    let metadata: Value = serde_json::from_slice(&output.stdout).map_err(|_| pin_error)?;
+    serde_json::from_slice(&output.stdout).map_err(|_| step.into())
+}
+
+fn check() -> Result<(), String> {
+    run("cargo fmt", &mut cargo(&["fmt", "--all", "--check"]))?;
+    run(
+        "cargo clippy",
+        &mut cargo(&[
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--locked",
+            "--",
+            "-D",
+            "warnings",
+        ]),
+    )?;
+    run(
+        "cargo test",
+        cargo(&["test", "--workspace", "--locked"]).env("NO_PROXY", no_proxy()),
+    )?;
+    run(
+        "cargo build --release",
+        &mut cargo(&["build", "-p", "crabber-coworkers", "--release", "--locked"]),
+    )?;
+    let metadata = cargo_metadata()?;
     if !verify_crabber_source(&metadata, pins::CRABBER_REV) {
-        return Err(pin_error.into());
+        return Err("crabber dependency pin differs from xtask/src/pins.rs".into());
     }
     let target = metadata["target_directory"]
         .as_str()
         .ok_or("cargo metadata target_directory")?;
-    let status = Command::new(
-        std::path::Path::new(target)
-            .join("release/crabber-coworkers")
-            .with_extension(std::env::consts::EXE_EXTENSION),
+    let binary = std::path::Path::new(target)
+        .join("release/crabber-coworkers")
+        .with_extension(std::env::consts::EXE_EXTENSION);
+    run(
+        "example config check",
+        Command::new(binary).current_dir(workspace_root()).args([
+            "check-config",
+            "--config",
+            "config.example.json",
+        ]),
     )
-    .current_dir(workspace_root())
-    .args(["check-config", "--config", "config.example.json"])
-    .status()
-    .map_err(|_| "example config check")?;
-    if !status.success() {
-        return Err("example config check".into());
-    }
-    Ok(())
 }
 
 fn verify_crabber_source(metadata: &Value, rev: &str) -> bool {

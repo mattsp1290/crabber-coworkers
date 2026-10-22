@@ -1,8 +1,5 @@
-pub const PROVIDER_ID: &str = "opencode-go";
-pub const MODEL_ID: &str = "deepseek-v4-flash";
 pub const MAX_CONFIG_BYTES: u64 = 262_144;
 pub const MAX_INSTRUCTIONS_BYTES: usize = 16_384;
-pub const API_KEY_ENV: &str = "OPENCODE_GO_API_KEY";
 pub const MAX_COWORKERS: usize = 32;
 pub const MAX_ID_BYTES: usize = 64;
 pub const MAX_NAME_BYTES: usize = 100;

@@ -58,17 +58,22 @@ fn oversized_config() {
 }
 
 #[test]
-fn missing_api_key() {
-    let output = binary()
-        .args(["ask", "--config"])
-        .arg(example())
-        .args(["scout", "hi"])
-        .env_remove("OPENCODE_GO_API_KEY")
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(output.stderr, b"OPENCODE_GO_API_KEY is not set\n");
-    assert_eq!(output.stdout, b"");
+fn missing_or_blank_api_key() {
+    for key in [None, Some(""), Some("  ")] {
+        let mut command = binary();
+        command
+            .args(["ask", "--config"])
+            .arg(example())
+            .args(["scout", "hi"])
+            .env_remove("OPENCODE_GO_API_KEY");
+        if let Some(key) = key {
+            command.env("OPENCODE_GO_API_KEY", key);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.stderr, b"OPENCODE_GO_API_KEY is not set\n");
+        assert_eq!(output.stdout, b"");
+    }
 }
 #[test]
 fn validation_precedes_key_check() {
@@ -87,29 +92,4 @@ fn validation_precedes_key_check() {
         assert_eq!(output.stderr, b"unknown coworker\n");
         assert_eq!(output.stdout, b"");
     }
-}
-#[test]
-fn empty_api_key() {
-    let output = binary()
-        .args(["ask", "--config"])
-        .arg(example())
-        .args(["scout", "hi"])
-        .env("OPENCODE_GO_API_KEY", "")
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(output.stderr, b"OPENCODE_GO_API_KEY is not set\n");
-}
-
-#[test]
-fn whitespace_api_key() {
-    let output = binary()
-        .args(["ask", "--config"])
-        .arg(example())
-        .args(["scout", "hi"])
-        .env("OPENCODE_GO_API_KEY", "  ")
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(output.stderr, b"OPENCODE_GO_API_KEY is not set\n");
 }

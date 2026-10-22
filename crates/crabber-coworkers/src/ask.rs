@@ -4,7 +4,7 @@ use crate::{
 };
 use crabber::{
     Selection,
-    core::{ContentBlock, PartKind, Role, RunStatus},
+    core::{ContentBlock, Message, PartKind, Role, RunId, RunStatus},
     providers::Resolver,
     session::{MemoryStore, Store},
 };
@@ -35,7 +35,7 @@ impl AskError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::UnknownCoworker | Self::EmptyPrompt | Self::PromptTooLarge => 2,
-            _ => 1,
+            Self::Build | Self::Run | Self::NotCompleted | Self::NoAnswer | Self::Timeout => 1,
         }
     }
 }
@@ -88,26 +88,30 @@ pub async fn ask(
             .list_messages(&result.session_id, None)
             .await
             .map_err(|_| AskError::Run)?;
-        let message = messages
-            .into_iter()
-            .rev()
-            .find(|m| m.role == Role::Assistant && m.run_id.as_ref() == Some(&result.run_id))
-            .ok_or(AskError::NoAnswer)?;
-        let mut parts = message.parts;
-        parts.sort_by_key(|p| p.ordinal);
-        let answer: String = parts
-            .into_iter()
-            .filter_map(|p| match (p.kind, p.content) {
-                (PartKind::AssistantText, ContentBlock::Text { text }) => Some(text),
-                _ => None,
-            })
-            .collect();
-        if answer.is_empty() {
-            Err(AskError::NoAnswer)
-        } else {
-            Ok(answer)
-        }
+        committed_text(messages, &result.run_id)
     })
     .await
     .map_err(|_| AskError::Timeout)?
+}
+
+fn committed_text(messages: Vec<Message>, run_id: &RunId) -> Result<String, AskError> {
+    let message = messages
+        .into_iter()
+        .rev()
+        .find(|m| m.role == Role::Assistant && m.run_id.as_ref() == Some(run_id))
+        .ok_or(AskError::NoAnswer)?;
+    let mut parts = message.parts;
+    parts.sort_by_key(|p| p.ordinal);
+    let answer: String = parts
+        .into_iter()
+        .filter_map(|p| match (p.kind, p.content) {
+            (PartKind::AssistantText, ContentBlock::Text { text }) => Some(text),
+            _ => None,
+        })
+        .collect();
+    if answer.is_empty() {
+        Err(AskError::NoAnswer)
+    } else {
+        Ok(answer)
+    }
 }

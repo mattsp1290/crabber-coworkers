@@ -55,14 +55,40 @@ pub async fn run_with(
     execute(cli, Provider::Injected(resolver), selection, out, err).await
 }
 
-fn fail(err: &mut (dyn Write + Send), message: &str, code: i32) -> i32 {
-    let _ = writeln!(err, "{message}");
-    code
+#[derive(Debug, thiserror::Error)]
+enum AppError {
+    #[error(transparent)]
+    Config(#[from] config::ConfigError),
+    #[error(transparent)]
+    Ask(#[from] crate::ask::AskError),
+    #[error("OPENCODE_GO_API_KEY is not set")]
+    MissingApiKey,
+    #[error("cannot write output")]
+    Output,
+}
+
+impl AppError {
+    fn exit_code(&self) -> i32 {
+        match self {
+            Self::Config(_) | Self::MissingApiKey => 2,
+            Self::Ask(error) => error.exit_code(),
+            Self::Output => 1,
+        }
+    }
 }
 
 enum Provider {
     FromEnv,
     Injected(Arc<dyn Resolver>),
+}
+
+impl Provider {
+    fn resolve(self) -> Option<Arc<dyn Resolver>> {
+        match self {
+            Self::FromEnv => bridge::opencode_go_resolver_from_env(),
+            Self::Injected(resolver) => Some(resolver),
+        }
+    }
 }
 
 async fn execute(
@@ -72,60 +98,49 @@ async fn execute(
     out: &mut (dyn Write + Send),
     err: &mut (dyn Write + Send),
 ) -> i32 {
-    let path = match &cli.command {
-        Command::CheckConfig { config } | Command::Ask { config, .. } => config,
-    };
-    let config = match config::load(path) {
-        Ok(config) => config,
-        Err(error) => return fail(err, &error.to_string(), 2),
-    };
-    let output = match cli.command {
-        Command::CheckConfig { .. } => {
-            let mut listing = String::new();
-            for def in &config.coworkers {
-                listing.push_str(&def.id);
-                listing.push('\t');
-                listing.push_str(&def.name);
-                listing.push('\n');
-            }
-            listing
+    match respond(cli, provider, selection)
+        .await
+        .and_then(|output| emit(out, &output))
+    {
+        Ok(()) => 0,
+        Err(error) => {
+            let _ = writeln!(err, "{error}");
+            error.exit_code()
         }
+    }
+}
+
+async fn respond(cli: Cli, provider: Provider, selection: Selection) -> Result<String, AppError> {
+    match cli.command {
+        Command::CheckConfig { config } => Ok(listing(&config::load(&config)?)),
         Command::Ask {
+            config,
             coworker_id,
             prompt,
-            ..
         } => {
-            let def = match validate_request(&config, &coworker_id, &prompt) {
-                Ok(def) => def,
-                Err(error) => return fail(err, &error.to_string(), error.exit_code()),
-            };
-            let resolver = match provider {
-                Provider::Injected(resolver) => resolver,
-                Provider::FromEnv => match bridge::opencode_go_resolver_from_env() {
-                    Some(resolver) => resolver,
-                    None => return fail(err, "OPENCODE_GO_API_KEY is not set", 2),
-                },
-            };
-            match ask(
-                def,
-                &prompt,
-                resolver,
-                selection,
-                Duration::from_secs(config.limits.model_turn_seconds),
-            )
-            .await
-            {
-                Ok(answer) => format!("{answer}\n"),
-                Err(error) => return fail(err, &error.to_string(), error.exit_code()),
-            }
+            let config = config::load(&config)?;
+            let def = validate_request(&config, &coworker_id, &prompt)?;
+            let resolver = provider.resolve().ok_or(AppError::MissingApiKey)?;
+            let timeout = Duration::from_secs(config.limits.model_turn_seconds);
+            let answer = ask(def, &prompt, resolver, selection, timeout).await?;
+            Ok(format!("{answer}\n"))
         }
-    };
-    if out
-        .write_all(output.as_bytes())
-        .and_then(|()| out.flush())
-        .is_err()
-    {
-        return fail(err, "cannot write output", 1);
     }
-    0
+}
+
+fn listing(config: &config::Config) -> String {
+    let mut listing = String::new();
+    for def in &config.coworkers {
+        listing.push_str(&def.id);
+        listing.push('\t');
+        listing.push_str(&def.name);
+        listing.push('\n');
+    }
+    listing
+}
+
+fn emit(out: &mut (dyn Write + Send), output: &str) -> Result<(), AppError> {
+    out.write_all(output.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(|_| AppError::Output)
 }
