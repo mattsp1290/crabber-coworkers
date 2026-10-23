@@ -208,7 +208,7 @@ fn deadline() -> tokio::time::Instant {
 #[tokio::test]
 async fn conversation_continues_across_store_instances() {
     let dir = tempfile::tempdir().unwrap();
-    let config = example::config();
+    let mut config = example::config();
     let def = config.coworker("scout").unwrap();
     assert_eq!(
         ask(
@@ -224,6 +224,8 @@ async fn conversation_continues_across_store_instances() {
         .unwrap(),
         "first answer"
     );
+    config.coworkers[0].instructions = "Use the updated instructions.".into();
+    let def = config.coworker("scout").unwrap();
     let provider = scripted("second answer");
     assert_eq!(
         ask(
@@ -240,7 +242,10 @@ async fn conversation_continues_across_store_instances() {
         "second answer"
     );
     let requests = provider.requests();
-    assert!(requests[0].system.as_ref().unwrap().contains("Scout"));
+    assert_eq!(
+        requests[0].system.as_deref(),
+        Some(crabber_coworkers::bridge::system_prompt(def).as_str())
+    );
     let messages: Vec<_> = requests[0]
         .messages
         .iter()
@@ -624,7 +629,7 @@ async fn ephemeral_session_writes_nothing() {
 }
 
 #[tokio::test]
-async fn deadline_covers_admission() {
+async fn durable_turn_deadline_leaves_no_unfinished_run() {
     use crabber::session::Store;
     let dir = tempfile::tempdir().unwrap();
     let config = example::config();
@@ -652,4 +657,137 @@ async fn deadline_covers_admission() {
     );
     assert!(started.elapsed() < Duration::from_secs(7));
     assert_eq!(store.list_unfinished_runs().await.unwrap().len(), 0);
+}
+
+struct AdmissionGate {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+#[async_trait::async_trait]
+impl crabber::providers::Resolver for AdmissionGate {
+    fn binding_descriptor(
+        &self,
+        selection: &crabber::Selection,
+    ) -> Result<crabber::core::ProviderBindingDescriptor, crabber::providers::ProviderBindingError>
+    {
+        // Descriptor capture is inside admission. Block only this deliberately
+        // instrumented test resolver; the second runtime worker releases it.
+        self.started.notify_one();
+        let (lock, condition) = self.release.as_ref();
+        drop(
+            condition
+                .wait_while(lock.lock().unwrap(), |released| !*released)
+                .unwrap(),
+        );
+        crabber::providers::Resolver::binding_descriptor(&common::Pending, selection)
+    }
+    async fn resolve(
+        &self,
+        _: &crabber::Selection,
+    ) -> Result<Arc<dyn crabber::providers::Streamer>, crabber::providers::ProviderError> {
+        Ok(Arc::new(common::Pending))
+    }
+}
+
+struct ReleaseAdmission(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+impl Drop for ReleaseAdmission {
+    fn drop(&mut self) {
+        let (lock, condition) = self.0.as_ref();
+        *lock.lock().unwrap() = true;
+        condition.notify_all();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_deadline_interrupts_after_held_admission_finishes() {
+    use crabber::session::Store;
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(example::config());
+    let db = crabber_coworkers::store::open(dir.path(), "scout")
+        .await
+        .unwrap();
+    ask(
+        config.coworker("scout").unwrap(),
+        "setup",
+        scripted("ok"),
+        common::selection(),
+        deadline(),
+        Session::Durable {
+            store: db.clone(),
+            name: "weekly".into(),
+        },
+        common::never(),
+    )
+    .await
+    .unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let guard = ReleaseAdmission(release.clone());
+    let resolver = Arc::new(AdmissionGate {
+        started: started.clone(),
+        release,
+    });
+    let worker_config = config.clone();
+    let worker_db = db.clone();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    let worker = tokio::spawn(async move {
+        ask(
+            worker_config.coworker("scout").unwrap(),
+            "held admission",
+            resolver,
+            common::selection(),
+            deadline,
+            Session::Durable {
+                store: worker_db,
+                name: "weekly".into(),
+            },
+            common::never(),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    tokio::time::sleep_until(deadline).await;
+    assert!(
+        !worker.is_finished(),
+        "admission must stay owned until it finishes"
+    );
+    drop(guard);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err(),
+        AskError::Timeout
+    );
+    assert_eq!(db.list_unfinished_runs().await.unwrap().len(), 0);
+    let messages = db
+        .list_messages(&crabber::SessionId::from("weekly"), None)
+        .await
+        .unwrap();
+    let id = messages
+        .iter()
+        .rev()
+        .find_map(|m| m.run_id.as_ref())
+        .unwrap();
+    assert_eq!(
+        db.get_run(id).await.unwrap().unwrap().status,
+        crabber::core::RunStatus::Interrupted
+    );
+    assert_eq!(
+        ask(
+            config.coworker("scout").unwrap(),
+            "again",
+            scripted("ok"),
+            common::selection(),
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            durable(dir.path(), "scout").await,
+            common::never()
+        )
+        .await
+        .unwrap(),
+        "ok"
+    );
 }

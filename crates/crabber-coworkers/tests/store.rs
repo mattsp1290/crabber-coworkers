@@ -124,3 +124,69 @@ async fn symlinked_store_file_is_refused() {
     assert_eq!(std::fs::read(&target).unwrap(), b"secret-marker");
     assert_eq!(mode(&target), original_mode);
 }
+
+#[tokio::test]
+async fn existing_non_file_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(store::store_path(dir.path(), "scout")).unwrap();
+    let result = store::connect_existing(dir.path(), "scout").await;
+    assert!(result.is_err());
+    assert_eq!(
+        result.err().unwrap().to_string(),
+        "cannot open conversation store"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn permissive_live_sidecars_are_restricted() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let original = store::open(dir.path(), "scout").await.unwrap();
+    let files = ["scout.sqlite", "scout.sqlite-wal", "scout.sqlite-shm"];
+    for name in files {
+        let path = dir.path().join(name);
+        assert!(path.exists());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let _reopened = store::open(dir.path(), "scout").await.unwrap();
+    for name in files {
+        assert_eq!(mode(&dir.path().join(name)), 0o600);
+    }
+    drop(original);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_sidecars_are_refused_without_touching_target() {
+    use std::os::unix::fs::symlink;
+    for suffix in ["-wal", "-shm"] {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, "secret-marker").unwrap();
+        let original_mode = mode(&target);
+        symlink(&target, dir.path().join(format!("scout.sqlite{suffix}"))).unwrap();
+        assert!(store::open(dir.path(), "scout").await.is_err());
+        assert_eq!(mode(&target), original_mode);
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "secret-marker");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn metadata_permission_errors_are_redacted() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let _store = store::open(dir.path(), "scout").await.unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+    let metadata_denied = std::fs::metadata(store::store_path(dir.path(), "scout")).is_err();
+    let result = store::connect_existing(dir.path(), "scout").await;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    if metadata_denied {
+        assert!(result.is_err());
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "cannot open conversation store"
+        );
+    }
+}
