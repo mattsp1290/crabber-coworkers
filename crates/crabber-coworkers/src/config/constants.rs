@@ -10,3 +10,9 @@ pub const DEFAULT_PROMPT_BYTES: usize = 32_768;
 pub const DEFAULT_TURN_SECONDS: u64 = 120;
 
 pub const MAX_STATE_DIR_BYTES: usize = 4_096;
+
+pub const MAX_SLACK_ID_BYTES: usize = 32;
+pub const MAX_ALLOWED_CHANNELS: usize = 64;
+pub const MAX_ALLOWED_USERS: usize = 256;
+pub const DEFAULT_CONCURRENT_TURNS: usize = 4;
+pub const MAX_CONCURRENT_TURNS: usize = 32;

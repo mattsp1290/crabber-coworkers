@@ -1,8 +1,9 @@
 pub mod constants;
 use constants::{
-    DEFAULT_PROMPT_BYTES, DEFAULT_TURN_SECONDS, MAX_CONFIG_BYTES, MAX_COWORKERS, MAX_ID_BYTES,
-    MAX_INSTRUCTIONS_BYTES, MAX_NAME_BYTES, MAX_PROMPT_BYTES, MAX_ROLE_BYTES, MAX_STATE_DIR_BYTES,
-    MAX_TURN_SECONDS,
+    DEFAULT_CONCURRENT_TURNS, DEFAULT_PROMPT_BYTES, DEFAULT_TURN_SECONDS, MAX_ALLOWED_CHANNELS,
+    MAX_ALLOWED_USERS, MAX_CONCURRENT_TURNS, MAX_CONFIG_BYTES, MAX_COWORKERS, MAX_ID_BYTES,
+    MAX_INSTRUCTIONS_BYTES, MAX_NAME_BYTES, MAX_PROMPT_BYTES, MAX_ROLE_BYTES, MAX_SLACK_ID_BYTES,
+    MAX_STATE_DIR_BYTES, MAX_TURN_SECONDS,
 };
 use serde::Deserialize;
 use std::{
@@ -28,6 +29,16 @@ pub struct CoworkerDefinition {
     pub name: String,
     pub role: String,
     pub instructions: String,
+    #[serde(default)]
+    pub slack: Option<SlackConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SlackConfig {
+    pub team_id: String,
+    pub allowed_channel_ids: Vec<String>,
+    pub allowed_user_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +46,7 @@ pub struct CoworkerDefinition {
 pub struct Limits {
     pub max_prompt_bytes: usize,
     pub model_turn_seconds: u64,
+    pub max_concurrent_turns: usize,
 }
 
 impl Default for Limits {
@@ -42,6 +54,7 @@ impl Default for Limits {
         Self {
             max_prompt_bytes: DEFAULT_PROMPT_BYTES,
             model_turn_seconds: DEFAULT_TURN_SECONDS,
+            max_concurrent_turns: DEFAULT_CONCURRENT_TURNS,
         }
     }
 }
@@ -54,6 +67,10 @@ impl Config {
     #[must_use]
     pub fn coworker(&self, id: &str) -> Option<&CoworkerDefinition> {
         self.coworkers.iter().find(|coworker| coworker.id == id)
+    }
+
+    pub fn slack_coworkers(&self) -> impl Iterator<Item = &CoworkerDefinition> {
+        self.coworkers.iter().filter(|def| def.slack.is_some())
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -103,6 +120,40 @@ impl Config {
                     ));
                 }
             }
+            if let Some(slack) = &def.slack {
+                if !valid_slack_id(&slack.team_id, b"T") {
+                    errors.push(format!(
+                        "coworkers[{i}].slack.team_id must be a Slack team ID"
+                    ));
+                }
+                for (field, values, prefixes, cap, kind) in [
+                    (
+                        "allowed_channel_ids",
+                        &slack.allowed_channel_ids,
+                        &b"CG"[..],
+                        MAX_ALLOWED_CHANNELS,
+                        "channel",
+                    ),
+                    (
+                        "allowed_user_ids",
+                        &slack.allowed_user_ids,
+                        &b"UW"[..],
+                        MAX_ALLOWED_USERS,
+                        "user",
+                    ),
+                ] {
+                    if values.is_empty()
+                        || values.len() > cap
+                        || values.iter().any(|v| !valid_slack_id(v, prefixes))
+                        || values.iter().collect::<HashSet<_>>().len() != values.len()
+                    {
+                        errors.push(format!("coworkers[{i}].slack.{field} must contain 1–{cap} unique Slack {kind} IDs"));
+                    }
+                }
+            }
+        }
+        if !(1..=MAX_CONCURRENT_TURNS).contains(&self.limits.max_concurrent_turns) {
+            errors.push("limits.max_concurrent_turns must be in 1..=32".into());
         }
         if !(1..=MAX_PROMPT_BYTES).contains(&self.limits.max_prompt_bytes) {
             errors.push(format!(
@@ -120,6 +171,15 @@ impl Config {
             Err(ConfigError(errors.join("\n")))
         }
     }
+}
+
+#[must_use]
+pub fn valid_slack_id(id: &str, prefixes: &[u8]) -> bool {
+    (2..=MAX_SLACK_ID_BYTES).contains(&id.len())
+        && prefixes.contains(&id.as_bytes()[0])
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
 
 #[must_use]
@@ -180,6 +240,92 @@ mod tests {
         std::fs::write(file.path(), value.to_string()).unwrap();
         load(file.path())
     }
+    #[test]
+    fn slack_block_parses() {
+        let config = parse(&example()).unwrap();
+        let slack = config.coworker("scout").unwrap().slack.as_ref().unwrap();
+        assert_eq!(slack.team_id, "T0000000001");
+        assert_eq!(slack.allowed_channel_ids, ["C0000000001"]);
+        assert_eq!(slack.allowed_user_ids, ["U0000000001"]);
+        assert!(config.coworker("quill").unwrap().slack.is_none());
+        assert_eq!(config.slack_coworkers().count(), 1);
+        assert_eq!(config.limits.max_concurrent_turns, 4);
+    }
+
+    #[test]
+    fn slack_unknown_key() {
+        let mut v = example();
+        v["coworkers"][0]["slack"]["secret-marker"] = json!(true);
+        let error = parse(&v).unwrap_err().to_string();
+        assert!(error.ends_with("(data)"));
+        assert!(!error.contains("secret-marker"));
+    }
+
+    #[test]
+    fn slack_team_id_shape_and_redaction() {
+        for team in [
+            String::new(),
+            "t123".into(),
+            "T".into(),
+            "T-1".into(),
+            "T".repeat(33),
+            "secret-marker".into(),
+        ] {
+            let mut v = example();
+            v["coworkers"][0]["slack"]["team_id"] = json!(team);
+            assert_eq!(
+                parse(&v).unwrap_err().to_string(),
+                "coworkers[0].slack.team_id must be a Slack team ID"
+            );
+        }
+        let mut v = example();
+        v["coworkers"][0]["slack"]["team_id"] = json!("T0G9PQBBK");
+        assert!(parse(&v).is_ok());
+    }
+
+    #[test]
+    fn slack_channel_and_user_lists() {
+        for (field, prefix, cap, kind) in [
+            ("allowed_channel_ids", "C", 64, "channel"),
+            ("allowed_user_ids", "U", 256, "user"),
+        ] {
+            for invalid in [json!([]), json!(["C1", "C1"]), json!(["c1"]), json!(["T1"])] {
+                let mut v = example();
+                v["coworkers"][0]["slack"][field] = invalid;
+                assert_eq!(
+                    parse(&v).unwrap_err().to_string(),
+                    format!(
+                        "coworkers[0].slack.{field} must contain 1–{cap} unique Slack {kind} IDs"
+                    )
+                );
+            }
+            let mut v = example();
+            v["coworkers"][0]["slack"][field] =
+                json!((0..cap).map(|i| format!("{prefix}{i}")).collect::<Vec<_>>());
+            assert!(parse(&v).is_ok());
+            v["coworkers"][0]["slack"][field]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(format!("{prefix}{cap}")));
+            assert!(parse(&v).is_err());
+        }
+        let mut v = example();
+        v["coworkers"][0]["slack"]["allowed_channel_ids"] = json!(["U1"]);
+        assert!(parse(&v).is_err());
+    }
+
+    #[test]
+    fn max_concurrent_turns_bounds() {
+        for count in [0, 33] {
+            let mut v = example();
+            v["limits"] = json!({"max_concurrent_turns":count});
+            assert_eq!(
+                parse(&v).unwrap_err().to_string(),
+                "limits.max_concurrent_turns must be in 1..=32"
+            );
+        }
+    }
+
     #[test]
     fn example_parses() {
         let config = parse(&example()).unwrap();

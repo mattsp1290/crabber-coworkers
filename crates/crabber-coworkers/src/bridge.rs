@@ -93,6 +93,7 @@ mod tests {
     #[test]
     fn exact_system_prompt() {
         let def = CoworkerDefinition {
+            slack: None,
             id: "scout".into(),
             name: "Scout".into(),
             role: "Researcher".into(),
