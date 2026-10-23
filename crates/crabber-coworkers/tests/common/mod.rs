@@ -79,3 +79,5 @@ pub fn write_state_config(
     std::fs::write(&path, config.to_string()).unwrap();
     path
 }
+
+pub mod slack;

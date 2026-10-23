@@ -337,6 +337,11 @@ async fn cancel_before_store_open_starts_nothing() {
 async fn list_conversations_lists_names_and_utc() {
     let temp = tempfile::tempdir().unwrap();
     let file = common::write_state_config(temp.path(), 1);
+    // Keep a connection alive so asynchronous writer-pool teardown cannot
+    // checkpoint the WAL between the two metadata observations on Linux.
+    let _keeper = crabber_coworkers::store::open(&temp.path().join("state"), "scout")
+        .await
+        .unwrap();
     for name in ["alpha", "beta"] {
         assert_eq!(
             run_with(
