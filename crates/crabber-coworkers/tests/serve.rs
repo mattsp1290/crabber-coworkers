@@ -603,3 +603,17 @@ async fn stopping_during_delivery_is_not_a_failure() {
     assert_eq!(fake.posted().len(), 0);
     ask_again(&path).await;
 }
+
+#[tokio::test]
+async fn api_authored_user_mentions_are_acked_and_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = config(dir.path(), 5);
+    let fake = FakeSlack::start(identity()).await;
+    let provider = provider();
+    let service = launch(&path, &fake, provider.clone(), &["scout"]);
+    fake.send(common::slack::api_authored_mention()).await;
+    wait_until(|| fake.acks().len() == 1).await;
+    assert_eq!(fake.posted().len(), 0);
+    assert_eq!(provider.requests().len(), 0);
+    assert_eq!(service.stop().await.0, 0);
+}

@@ -32,7 +32,7 @@ Confirm the second answer uses the first exchange and `smoke` appears in the lis
 
 ## Slack live check
 
-Configure the app and environment as described in [Slack setup](slack-setup.md), then run `serve --config config.json`.
+Configure the app and environment as described in [Slack setup](slack-setup.md), then run `serve --config config.json`. Send the mentions from your Slack client. API-authored messages can carry `bot_id` even with a user token; the bot filter intentionally ignores them.
 
 1. As an allowlisted user in an allowlisted channel, mention the coworker. Confirm a threaded answer.
 2. Mention it inside that thread. Confirm the reply uses the first exchange. Record only the event object's **key names**, such as `type, user, text, ts, channel, event_ts, thread_ts`, never their values.
@@ -49,6 +49,8 @@ Record only outcomes and event key names. Never record token values, real team/c
 | Date | Commit SHA | Crabber rev | Coworker | Step | Observed result / event key names |
 | --- | --- | --- | --- | --- | --- |
 
-Live qualification is pending: no Slack or model credential variables were available in the implementation process environment. This is not a successful live record.
+A live TLS/Socket Mode probe on 2026-10-23 at `0078fa2ced880c240ac9ea50363f000bf3d46a8c` observed these keys on an API-authored threaded `app_mention`: `app_id, blocks, bot_id, bot_profile, channel, event_ts, parent_user_id, team, text, thread_ts, ts, type, user`. The fake includes this shape and proves it is acknowledged and ignored, even when the user is allowlisted.
+
+Required human-authored steps 1–4 remain pending; the API probe is not a successful G4 record.
 
 Check the manifest template independently: its `bot_events` list must contain only `app_mention`, with no `message.*` event.

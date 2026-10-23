@@ -296,3 +296,21 @@ fn http_server(
         }
     })
 }
+
+/// Shape observed from a real API-authored threaded `app_mention`.
+/// Even when user matches the allowlist, `bot_id` makes it ineligible.
+pub fn api_authored_mention() -> Value {
+    envelope(
+        "api-event",
+        0,
+        json!({
+            "type":"event_callback","team_id":"T1","event_id":"api-event",
+            "event":{
+                "app_id":"A1","blocks":[],"bot_id":"B1","bot_profile":{},
+                "channel":"C1","event_ts":"1.000002","parent_user_id":"U1",
+                "team":"T1","text":"<@UBOT> synthetic check","thread_ts":"1.000001",
+                "ts":"1.000002","type":"app_mention","user":"U1"
+            }
+        }),
+    )
+}
