@@ -1,3 +1,6 @@
+// Shared fixtures are used in different combinations by each integration test binary.
+#![allow(dead_code)]
+
 use async_trait::async_trait;
 use crabber::{
     Selection, StreamDelta,
@@ -57,4 +60,8 @@ impl Streamer for Pending {
     async fn stream(&self, _: ModelRequest) -> Result<DeltaStream, ProviderError> {
         Ok(Box::pin(futures::stream::pending()))
     }
+}
+
+pub fn never() -> crabber_coworkers::ask::Cancel {
+    Box::pin(std::future::pending())
 }

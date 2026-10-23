@@ -30,8 +30,22 @@ pub fn build_agent(
     resolver: Arc<dyn Resolver>,
     selection: Selection,
 ) -> Result<Agent, BuildError> {
+    build_agent_with_behavior(def, store, resolver, selection, BEHAVIOR_VERSION)
+}
+
+/// Build a tool-free agent with an explicit host behavior version.
+///
+/// # Errors
+/// Returns a build error for invalid runtime components.
+pub fn build_agent_with_behavior(
+    def: &CoworkerDefinition,
+    store: Arc<dyn Store>,
+    resolver: Arc<dyn Resolver>,
+    selection: Selection,
+    version: &str,
+) -> Result<Agent, BuildError> {
     Agent::builder()
-        .behavior_version(BEHAVIOR_VERSION)
+        .behavior_version(version)
         .store(store)
         .provider(resolver)
         .config(AgentConfig {
