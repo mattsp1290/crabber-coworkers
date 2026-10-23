@@ -1,3 +1,4 @@
+use crabber_coworkers::ask::Session;
 mod common;
 #[path = "common/example.rs"]
 mod example;
@@ -23,7 +24,9 @@ async fn happy_path() {
         "Find something",
         provider.clone(),
         selection,
-        Duration::from_secs(5),
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        Session::Ephemeral,
+        common::never(),
     )
     .await
     .unwrap();
@@ -53,7 +56,9 @@ async fn retry_returns_only_committed_text() {
         "hi",
         provider.clone(),
         common::selection(),
-        Duration::from_secs(5),
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        Session::Ephemeral,
+        common::never(),
     )
     .await
     .unwrap();
@@ -72,7 +77,9 @@ async fn coworker_isolation() {
         "hi",
         provider.clone(),
         common::selection(),
-        Duration::from_secs(5),
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        Session::Ephemeral,
+        common::never(),
     )
     .await
     .unwrap();
@@ -84,14 +91,14 @@ async fn coworker_isolation() {
 #[test]
 fn unknown_coworker() {
     assert_eq!(
-        validate_request(&example::config(), "nobody", "hi").unwrap_err(),
+        validate_request(&example::config(), "nobody", "hi", None).unwrap_err(),
         AskError::UnknownCoworker
     );
 }
 #[test]
 fn empty_prompt() {
     assert_eq!(
-        validate_request(&example::config(), "scout", "   ").unwrap_err(),
+        validate_request(&example::config(), "scout", "   ", None).unwrap_err(),
         AskError::EmptyPrompt
     );
 }
@@ -102,7 +109,8 @@ fn oversized_prompt() {
         validate_request(
             &config,
             "scout",
-            &"x".repeat(config.limits.max_prompt_bytes + 1)
+            &"x".repeat(config.limits.max_prompt_bytes + 1),
+            None
         )
         .unwrap_err(),
         AskError::PromptTooLarge
@@ -116,7 +124,9 @@ async fn provider_failure_is_redacted() {
         "hi",
         Arc::new(FakeProvider::scripted(vec![vec![common::failure(false)]])),
         common::selection(),
-        Duration::from_secs(5),
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        Session::Ephemeral,
+        common::never(),
     )
     .await
     .unwrap_err();
@@ -132,7 +142,9 @@ async fn timeout_is_bounded() {
         "hi",
         Arc::new(common::Pending),
         common::selection(),
-        Duration::from_millis(100),
+        tokio::time::Instant::now() + Duration::from_millis(100),
+        Session::Ephemeral,
+        common::never(),
     )
     .await
     .unwrap_err();
@@ -150,7 +162,9 @@ async fn no_answer() {
             StreamDelta::Completed,
         ]])),
         common::selection(),
-        Duration::from_secs(5),
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        Session::Ephemeral,
+        common::never(),
     )
     .await
     .unwrap_err();
@@ -165,10 +179,615 @@ async fn empty_response_is_a_redacted_runtime_failure() {
         "hi",
         Arc::new(FakeProvider::scripted(vec![vec![StreamDelta::Completed]])),
         common::selection(),
-        Duration::from_secs(5),
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        Session::Ephemeral,
+        common::never(),
     )
     .await
     .unwrap_err();
     assert_eq!(error, AskError::Run);
     assert_eq!(error.to_string(), "model run failed");
+}
+
+async fn durable(dir: &std::path::Path, id: &str) -> Session {
+    Session::Durable {
+        store: crabber_coworkers::store::open(dir, id).await.unwrap(),
+        name: "weekly".into(),
+    }
+}
+fn scripted(answer: &str) -> Arc<FakeProvider> {
+    Arc::new(FakeProvider::scripted(vec![vec![
+        StreamDelta::TextDelta(answer.into()),
+        StreamDelta::Completed,
+    ]]))
+}
+fn deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + Duration::from_secs(5)
+}
+
+#[tokio::test]
+async fn conversation_continues_across_store_instances() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = example::config();
+    let def = config.coworker("scout").unwrap();
+    assert_eq!(
+        ask(
+            def,
+            "first question",
+            scripted("first answer"),
+            common::selection(),
+            deadline(),
+            durable(dir.path(), "scout").await,
+            common::never()
+        )
+        .await
+        .unwrap(),
+        "first answer"
+    );
+    config.coworkers[0].instructions = "Use the updated instructions.".into();
+    let def = config.coworker("scout").unwrap();
+    let provider = scripted("second answer");
+    assert_eq!(
+        ask(
+            def,
+            "second question",
+            provider.clone(),
+            common::selection(),
+            deadline(),
+            durable(dir.path(), "scout").await,
+            common::never()
+        )
+        .await
+        .unwrap(),
+        "second answer"
+    );
+    let requests = provider.requests();
+    assert_eq!(
+        requests[0].system.as_deref(),
+        Some(crabber_coworkers::bridge::system_prompt(def).as_str())
+    );
+    let messages: Vec<_> = requests[0]
+        .messages
+        .iter()
+        .map(|m| {
+            (
+                m.role,
+                m.parts
+                    .iter()
+                    .filter_map(|p| match &p.content {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        messages,
+        vec![
+            (Role::User, "first question".into()),
+            (Role::Assistant, "first answer".into()),
+            (Role::User, "second question".into())
+        ]
+    );
+}
+
+#[test]
+fn invalid_conversation_names() {
+    let config = example::config();
+    for name in ["Weekly", "a--b", "", "a_b", &"x".repeat(65)] {
+        assert_eq!(
+            validate_request(&config, "scout", "hi", Some(name)).unwrap_err(),
+            AskError::InvalidConversation
+        );
+    }
+    assert!(validate_request(&config, "scout", "hi", Some("weekly-1")).is_ok());
+}
+
+#[tokio::test]
+async fn timeout_interrupts_run_so_next_ask_continues() {
+    use crabber::session::Store;
+    let dir = tempfile::tempdir().unwrap();
+    let config = example::config();
+    let def = config.coworker("scout").unwrap();
+    let store = crabber_coworkers::store::open(dir.path(), "scout")
+        .await
+        .unwrap();
+    let start = std::time::Instant::now();
+    assert_eq!(
+        ask(
+            def,
+            "hi",
+            Arc::new(common::Pending),
+            common::selection(),
+            tokio::time::Instant::now() + Duration::from_millis(100),
+            Session::Durable {
+                store: store.clone(),
+                name: "weekly".into()
+            },
+            common::never()
+        )
+        .await
+        .unwrap_err(),
+        AskError::Timeout
+    );
+    assert!(start.elapsed() < Duration::from_secs(2));
+    assert_eq!(store.list_unfinished_runs().await.unwrap().len(), 0);
+    let messages = store
+        .list_messages(&crabber::SessionId::from("weekly"), None)
+        .await
+        .unwrap();
+    let id = messages.iter().find_map(|m| m.run_id.as_ref()).unwrap();
+    assert_eq!(
+        store.get_run(id).await.unwrap().unwrap().status,
+        crabber::core::RunStatus::Interrupted
+    );
+    assert_eq!(
+        ask(
+            def,
+            "again",
+            scripted("ok"),
+            common::selection(),
+            deadline(),
+            durable(dir.path(), "scout").await,
+            common::never()
+        )
+        .await
+        .unwrap(),
+        "ok"
+    );
+}
+
+#[tokio::test]
+async fn cancel_interrupts_run() {
+    use crabber::session::Store;
+    let dir = tempfile::tempdir().unwrap();
+    let config = example::config();
+    let store = crabber_coworkers::store::open(dir.path(), "scout")
+        .await
+        .unwrap();
+    let cancel = Box::pin(async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    });
+    assert_eq!(
+        ask(
+            config.coworker("scout").unwrap(),
+            "hi",
+            Arc::new(common::Pending),
+            common::selection(),
+            deadline(),
+            Session::Durable {
+                store: store.clone(),
+                name: "weekly".into()
+            },
+            cancel
+        )
+        .await
+        .unwrap_err(),
+        AskError::Interrupted
+    );
+    assert_eq!(store.list_unfinished_runs().await.unwrap().len(), 0);
+    assert_eq!(
+        ask(
+            config.coworker("scout").unwrap(),
+            "again",
+            scripted("ok"),
+            common::selection(),
+            deadline(),
+            durable(dir.path(), "scout").await,
+            common::never()
+        )
+        .await
+        .unwrap(),
+        "ok"
+    );
+}
+
+#[tokio::test]
+async fn cancel_already_fired_interrupts_immediately() {
+    use crabber::session::Store;
+    let dir = tempfile::tempdir().unwrap();
+    let config = example::config();
+    let store = crabber_coworkers::store::open(dir.path(), "scout")
+        .await
+        .unwrap();
+    assert_eq!(
+        ask(
+            config.coworker("scout").unwrap(),
+            "hi",
+            Arc::new(common::Pending),
+            common::selection(),
+            deadline(),
+            Session::Durable {
+                store: store.clone(),
+                name: "weekly".into()
+            },
+            Box::pin(std::future::ready(()))
+        )
+        .await
+        .unwrap_err(),
+        AskError::Interrupted
+    );
+    assert_eq!(store.list_unfinished_runs().await.unwrap().len(), 0);
+    // Ephemeral admission has no session-creation cancel check.
+    assert_eq!(
+        ask(
+            config.coworker("scout").unwrap(),
+            "hi",
+            Arc::new(common::Pending),
+            common::selection(),
+            deadline(),
+            Session::Ephemeral,
+            Box::pin(std::future::ready(()))
+        )
+        .await
+        .unwrap_err(),
+        AskError::Interrupted
+    );
+}
+
+#[tokio::test]
+async fn completed_answer_wins_over_pending_signal() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = example::config();
+    let store = crabber_coworkers::store::open(dir.path(), "scout")
+        .await
+        .unwrap();
+    // The exact simultaneous-ready ordering is covered by the library unit test.
+    let cancel = Box::pin(async {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    assert_eq!(
+        ask(
+            config.coworker("scout").unwrap(),
+            "hi",
+            scripted("ok"),
+            common::selection(),
+            deadline(),
+            Session::Durable {
+                store,
+                name: "weekly".into()
+            },
+            cancel
+        )
+        .await
+        .unwrap(),
+        "ok"
+    );
+}
+
+#[tokio::test]
+async fn conversations_are_isolated_per_coworker() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = example::config();
+    for id in ["scout", "quill"] {
+        let provider = scripted(id);
+        ask(
+            config.coworker(id).unwrap(),
+            "hi",
+            provider.clone(),
+            common::selection(),
+            deadline(),
+            durable(dir.path(), id).await,
+            common::never(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(provider.requests()[0].messages.len(), 1);
+    }
+    assert!(dir.path().join("scout.sqlite").is_file());
+    assert!(dir.path().join("quill.sqlite").is_file());
+}
+
+#[tokio::test]
+async fn busy_conversation_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = example::config();
+    let def = config.coworker("scout").unwrap();
+    // Initialize the named session, then hold a second turn open.
+    ask(
+        def,
+        "setup",
+        scripted("ok"),
+        common::selection(),
+        deadline(),
+        durable(dir.path(), "scout").await,
+        common::never(),
+    )
+    .await
+    .unwrap();
+    let store = crabber_coworkers::store::open(dir.path(), "scout")
+        .await
+        .unwrap();
+    let agent = crabber_coworkers::bridge::build_agent(
+        def,
+        store,
+        Arc::new(common::Pending),
+        common::selection(),
+    )
+    .unwrap();
+    let run = agent
+        .prompt(Some(crabber::SessionId::from("weekly")), "pending")
+        .await
+        .unwrap();
+    assert_eq!(
+        ask(
+            def,
+            "busy",
+            scripted("bad"),
+            common::selection(),
+            deadline(),
+            durable(dir.path(), "scout").await,
+            common::never()
+        )
+        .await
+        .unwrap_err(),
+        AskError::Busy
+    );
+    run.control().interrupt();
+    run.done().await.unwrap();
+}
+
+#[tokio::test]
+async fn behavior_version_change_keeps_conversation() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = example::config();
+    let def = config.coworker("scout").unwrap();
+    let store = crabber_coworkers::store::open(dir.path(), "scout")
+        .await
+        .unwrap();
+    let agent = crabber_coworkers::bridge::build_agent_with_behavior(
+        def,
+        store,
+        scripted("old answer"),
+        common::selection(),
+        "crabber-coworkers.test-v0",
+    )
+    .unwrap();
+    // Auto-created session ID becomes the conversation name on continuation.
+    let result = agent
+        .prompt(None, "old question")
+        .await
+        .unwrap()
+        .done()
+        .await
+        .unwrap();
+    let provider = scripted("new answer");
+    let session = Session::Durable {
+        store: crabber_coworkers::store::open(dir.path(), "scout")
+            .await
+            .unwrap(),
+        name: result.session_id.to_string(),
+    };
+    ask(
+        def,
+        "new question",
+        provider.clone(),
+        common::selection(),
+        deadline(),
+        session,
+        common::never(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(provider.requests()[0].messages.len(), 3);
+}
+
+#[tokio::test]
+async fn provider_failure_in_conversation_is_redacted() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = example::config();
+    let def = config.coworker("scout").unwrap();
+    let provider = Arc::new(FakeProvider::scripted(vec![vec![common::failure(false)]]));
+    let error = ask(
+        def,
+        "hi",
+        provider,
+        common::selection(),
+        deadline(),
+        durable(dir.path(), "scout").await,
+        common::never(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error, AskError::Run);
+    assert!(!error.to_string().contains("secret-marker"));
+    assert_eq!(
+        ask(
+            def,
+            "again",
+            scripted("ok"),
+            common::selection(),
+            deadline(),
+            durable(dir.path(), "scout").await,
+            common::never()
+        )
+        .await
+        .unwrap(),
+        "ok"
+    );
+}
+
+#[tokio::test]
+async fn ephemeral_session_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let mut config = example::config();
+    config.state_dir = state.clone();
+    ask(
+        config.coworker("scout").unwrap(),
+        "hi",
+        scripted("ok"),
+        common::selection(),
+        deadline(),
+        Session::Ephemeral,
+        common::never(),
+    )
+    .await
+    .unwrap();
+    assert!(!state.exists());
+}
+
+#[tokio::test]
+async fn durable_turn_deadline_leaves_no_unfinished_run() {
+    use crabber::session::Store;
+    let dir = tempfile::tempdir().unwrap();
+    let config = example::config();
+    let store = crabber_coworkers::store::open(dir.path(), "scout")
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    assert_eq!(
+        ask(
+            config.coworker("scout").unwrap(),
+            "hi",
+            Arc::new(common::Pending),
+            common::selection(),
+            deadline,
+            Session::Durable {
+                store: store.clone(),
+                name: "weekly".into()
+            },
+            common::never()
+        )
+        .await
+        .unwrap_err(),
+        AskError::Timeout
+    );
+    assert!(started.elapsed() < Duration::from_secs(7));
+    assert_eq!(store.list_unfinished_runs().await.unwrap().len(), 0);
+}
+
+struct AdmissionGate {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+#[async_trait::async_trait]
+impl crabber::providers::Resolver for AdmissionGate {
+    fn binding_descriptor(
+        &self,
+        selection: &crabber::Selection,
+    ) -> Result<crabber::core::ProviderBindingDescriptor, crabber::providers::ProviderBindingError>
+    {
+        // Descriptor capture is inside admission. Block only this deliberately
+        // instrumented test resolver; the second runtime worker releases it.
+        self.started.notify_one();
+        let (lock, condition) = self.release.as_ref();
+        drop(
+            condition
+                .wait_while(lock.lock().unwrap(), |released| !*released)
+                .unwrap(),
+        );
+        crabber::providers::Resolver::binding_descriptor(&common::Pending, selection)
+    }
+    async fn resolve(
+        &self,
+        _: &crabber::Selection,
+    ) -> Result<Arc<dyn crabber::providers::Streamer>, crabber::providers::ProviderError> {
+        Ok(Arc::new(common::Pending))
+    }
+}
+
+struct ReleaseAdmission(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+impl Drop for ReleaseAdmission {
+    fn drop(&mut self) {
+        let (lock, condition) = self.0.as_ref();
+        *lock.lock().unwrap() = true;
+        condition.notify_all();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_deadline_interrupts_after_held_admission_finishes() {
+    use crabber::session::Store;
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(example::config());
+    let db = crabber_coworkers::store::open(dir.path(), "scout")
+        .await
+        .unwrap();
+    ask(
+        config.coworker("scout").unwrap(),
+        "setup",
+        scripted("ok"),
+        common::selection(),
+        deadline(),
+        Session::Durable {
+            store: db.clone(),
+            name: "weekly".into(),
+        },
+        common::never(),
+    )
+    .await
+    .unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let guard = ReleaseAdmission(release.clone());
+    let resolver = Arc::new(AdmissionGate {
+        started: started.clone(),
+        release,
+    });
+    let worker_config = config.clone();
+    let worker_db = db.clone();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    let worker = tokio::spawn(async move {
+        ask(
+            worker_config.coworker("scout").unwrap(),
+            "held admission",
+            resolver,
+            common::selection(),
+            deadline,
+            Session::Durable {
+                store: worker_db,
+                name: "weekly".into(),
+            },
+            common::never(),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    tokio::time::sleep_until(deadline).await;
+    assert!(
+        !worker.is_finished(),
+        "admission must stay owned until it finishes"
+    );
+    drop(guard);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err(),
+        AskError::Timeout
+    );
+    assert_eq!(db.list_unfinished_runs().await.unwrap().len(), 0);
+    let messages = db
+        .list_messages(&crabber::SessionId::from("weekly"), None)
+        .await
+        .unwrap();
+    let id = messages
+        .iter()
+        .rev()
+        .find_map(|m| m.run_id.as_ref())
+        .unwrap();
+    assert_eq!(
+        db.get_run(id).await.unwrap().unwrap().status,
+        crabber::core::RunStatus::Interrupted
+    );
+    assert_eq!(
+        ask(
+            config.coworker("scout").unwrap(),
+            "again",
+            scripted("ok"),
+            common::selection(),
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            durable(dir.path(), "scout").await,
+            common::never()
+        )
+        .await
+        .unwrap(),
+        "ok"
+    );
 }

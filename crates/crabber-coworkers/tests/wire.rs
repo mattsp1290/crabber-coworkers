@@ -1,3 +1,5 @@
+mod common;
+use crabber_coworkers::ask::Session;
 #[path = "common/example.rs"]
 mod example;
 const SSE_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"pong\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
@@ -70,7 +72,9 @@ async fn opencode_go_request_shape() {
             "ping",
             Arc::clone(&resolver),
             production_selection(),
-            Duration::from_secs(5),
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            Session::Ephemeral,
+            common::never(),
         )
         .await
         .unwrap();

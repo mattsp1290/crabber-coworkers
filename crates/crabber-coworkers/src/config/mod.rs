@@ -1,14 +1,21 @@
 pub mod constants;
 use constants::{
     DEFAULT_PROMPT_BYTES, DEFAULT_TURN_SECONDS, MAX_CONFIG_BYTES, MAX_COWORKERS, MAX_ID_BYTES,
-    MAX_INSTRUCTIONS_BYTES, MAX_NAME_BYTES, MAX_PROMPT_BYTES, MAX_ROLE_BYTES, MAX_TURN_SECONDS,
+    MAX_INSTRUCTIONS_BYTES, MAX_NAME_BYTES, MAX_PROMPT_BYTES, MAX_ROLE_BYTES, MAX_STATE_DIR_BYTES,
+    MAX_TURN_SECONDS,
 };
 use serde::Deserialize;
-use std::{collections::HashSet, fs::File, io::Read, path::Path};
+use std::{
+    collections::HashSet,
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    pub state_dir: PathBuf,
     pub coworkers: Vec<CoworkerDefinition>,
     #[serde(default)]
     pub limits: Limits,
@@ -51,6 +58,15 @@ impl Config {
 
     fn validate(&self) -> Result<(), ConfigError> {
         let mut errors = Vec::new();
+        let state_dir = self.state_dir.to_string_lossy();
+        if state_dir.trim().is_empty() || state_dir.len() > MAX_STATE_DIR_BYTES {
+            errors.push(format!(
+                "state_dir must be non-empty and at most {MAX_STATE_DIR_BYTES} bytes"
+            ));
+        }
+        if state_dir.chars().any(char::is_control) {
+            errors.push("state_dir must not contain control characters".into());
+        }
         if !(1..=MAX_COWORKERS).contains(&self.coworkers.len()) {
             errors.push(format!("coworkers must contain 1–{MAX_COWORKERS} entries"));
         }
@@ -106,7 +122,8 @@ impl Config {
     }
 }
 
-fn valid_id(id: &str) -> bool {
+#[must_use]
+pub fn valid_id(id: &str) -> bool {
     id.len() <= MAX_ID_BYTES
         && id.split('-').all(|group| {
             !group.is_empty()
@@ -166,10 +183,31 @@ mod tests {
     #[test]
     fn example_parses() {
         let config = parse(&example()).unwrap();
+        assert_eq!(config.state_dir, PathBuf::from("state"));
         let scout = config.coworker("scout").unwrap();
         assert_eq!((&*scout.name, &*scout.role), ("Scout", "Researcher"));
         assert_eq!(config.limits.max_prompt_bytes, 32_768);
         assert_eq!(config.limits.model_turn_seconds, 120);
+    }
+    #[test]
+    fn state_dir_validation() {
+        let mut v = example();
+        v.as_object_mut().unwrap().remove("state_dir");
+        assert!(parse(&v).unwrap_err().to_string().ends_with("(data)"));
+        for value in ["  ".to_owned(), "x".repeat(4097)] {
+            let mut v = example();
+            v["state_dir"] = json!(value);
+            assert_eq!(
+                parse(&v).unwrap_err().to_string(),
+                "state_dir must be non-empty and at most 4096 bytes"
+            );
+        }
+        let mut v = example();
+        v["state_dir"] = json!("secret-marker\nb");
+        assert_eq!(
+            parse(&v).unwrap_err().to_string(),
+            "state_dir must not contain control characters"
+        );
     }
     #[test]
     fn unknown_top_level() {

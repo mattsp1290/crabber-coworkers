@@ -1,3 +1,5 @@
+pub const BEHAVIOR_VERSION: &str = "crabber-coworkers.v1";
+
 pub const PROVIDER_ID: &str = "opencode-go";
 pub const MODEL_ID: &str = "deepseek-v4-flash";
 pub const API_KEY_ENV: &str = "OPENCODE_GO_API_KEY";
@@ -28,7 +30,22 @@ pub fn build_agent(
     resolver: Arc<dyn Resolver>,
     selection: Selection,
 ) -> Result<Agent, BuildError> {
+    build_agent_with_behavior(def, store, resolver, selection, BEHAVIOR_VERSION)
+}
+
+/// Build a tool-free agent with an explicit host behavior version.
+///
+/// # Errors
+/// Returns a build error for invalid runtime components.
+pub fn build_agent_with_behavior(
+    def: &CoworkerDefinition,
+    store: Arc<dyn Store>,
+    resolver: Arc<dyn Resolver>,
+    selection: Selection,
+    version: &str,
+) -> Result<Agent, BuildError> {
     Agent::builder()
+        .behavior_version(version)
         .store(store)
         .provider(resolver)
         .config(AgentConfig {
@@ -38,6 +55,8 @@ pub fn build_agent(
             directory: ".".into(),
             title: def.name.clone(),
             system_prompt: Some(system_prompt(def)),
+            max_output_tokens: None,
+            model_controls: crabber::ModelControls::default(),
         })
         .policy(Arc::new(StaticPolicy::new(PermissionDecision::Deny)))
         .build()

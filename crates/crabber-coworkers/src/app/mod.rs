@@ -1,5 +1,5 @@
 use crate::{
-    ask::{ask, validate_request},
+    ask::{AskError, Cancel, Session, ask, validate_request},
     bridge, config,
 };
 use clap::{Parser, Subcommand};
@@ -25,12 +25,20 @@ pub enum Command {
         #[arg(long)]
         config: PathBuf,
     },
-    /// Ask one configured coworker a single question.
+    /// List a coworker's durable conversation names and update times.
+    ListConversations {
+        #[arg(long)]
+        config: PathBuf,
+        coworker_id: String,
+    },
+    /// Ask a configured coworker, optionally continuing a conversation.
     Ask {
         #[arg(long)]
         config: PathBuf,
         coworker_id: String,
         prompt: String,
+        #[arg(long)]
+        conversation: Option<String>,
     },
 }
 
@@ -39,6 +47,7 @@ pub async fn run(cli: Cli) -> i32 {
         cli,
         Provider::FromEnv,
         bridge::production_selection(),
+        None,
         &mut io::stdout(),
         &mut io::stderr(),
     )
@@ -49,10 +58,19 @@ pub async fn run_with(
     cli: Cli,
     resolver: Arc<dyn Resolver>,
     selection: Selection,
+    cancel: Option<Cancel>,
     out: &mut (dyn Write + Send),
     err: &mut (dyn Write + Send),
 ) -> i32 {
-    execute(cli, Provider::Injected(resolver), selection, out, err).await
+    execute(
+        cli,
+        Provider::Injected(resolver),
+        selection,
+        cancel,
+        out,
+        err,
+    )
+    .await
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -63,6 +81,12 @@ enum AppError {
     Ask(#[from] crate::ask::AskError),
     #[error("OPENCODE_GO_API_KEY is not set")]
     MissingApiKey,
+    #[error(transparent)]
+    Store(#[from] crate::store::StoreOpenError),
+    #[error("cannot list conversations")]
+    List,
+    #[error("cannot install signal handlers")]
+    Signal,
     #[error("cannot write output")]
     Output,
 }
@@ -72,7 +96,7 @@ impl AppError {
         match self {
             Self::Config(_) | Self::MissingApiKey => 2,
             Self::Ask(error) => error.exit_code(),
-            Self::Output => 1,
+            Self::Output | Self::Store(_) | Self::List | Self::Signal => 1,
         }
     }
 }
@@ -95,10 +119,11 @@ async fn execute(
     cli: Cli,
     provider: Provider,
     selection: Selection,
+    cancel: Option<Cancel>,
     out: &mut (dyn Write + Send),
     err: &mut (dyn Write + Send),
 ) -> i32 {
-    match respond(cli, provider, selection)
+    match respond(cli, provider, selection, cancel)
         .await
         .and_then(|output| emit(out, &output))
     {
@@ -110,19 +135,51 @@ async fn execute(
     }
 }
 
-async fn respond(cli: Cli, provider: Provider, selection: Selection) -> Result<String, AppError> {
+async fn respond(
+    cli: Cli,
+    provider: Provider,
+    selection: Selection,
+    cancel: Option<Cancel>,
+) -> Result<String, AppError> {
     match cli.command {
         Command::CheckConfig { config } => Ok(listing(&config::load(&config)?)),
+        Command::ListConversations {
+            config,
+            coworker_id,
+        } => {
+            let config = config::load(&config)?;
+            let def = config
+                .coworker(&coworker_id)
+                .ok_or(AskError::UnknownCoworker)?;
+            list_conversations(&config.state_dir, &def.id).await
+        }
         Command::Ask {
             config,
             coworker_id,
             prompt,
+            conversation,
         } => {
             let config = config::load(&config)?;
-            let def = validate_request(&config, &coworker_id, &prompt)?;
+            let def = validate_request(&config, &coworker_id, &prompt, conversation.as_deref())?;
             let resolver = provider.resolve().ok_or(AppError::MissingApiKey)?;
-            let timeout = Duration::from_secs(config.limits.model_turn_seconds);
-            let answer = ask(def, &prompt, resolver, selection, timeout).await?;
+            let mut cancel = match cancel {
+                Some(cancel) => cancel,
+                None => install_cancel().map_err(|_| AppError::Signal)?,
+            };
+            let deadline =
+                tokio::time::Instant::now() + Duration::from_secs(config.limits.model_turn_seconds);
+            let session = if let Some(name) = conversation {
+                let store = tokio::select! {
+                    biased;
+                    () = &mut cancel => return Err(AskError::Interrupted.into()),
+                    () = tokio::time::sleep_until(deadline) => return Err(AskError::Timeout.into()),
+                    store = crate::store::open(&config.state_dir, &def.id) => store?,
+                };
+                Session::Durable { store, name }
+            } else {
+                Session::Ephemeral
+            };
+            let answer = ask(def, &prompt, resolver, selection, deadline, session, cancel).await?;
             Ok(format!("{answer}\n"))
         }
     }
@@ -143,4 +200,65 @@ fn emit(out: &mut (dyn Write + Send), output: &str) -> Result<(), AppError> {
     out.write_all(output.as_bytes())
         .and_then(|()| out.flush())
         .map_err(|_| AppError::Output)
+}
+
+/// Register signal handlers synchronously before any durable state is opened.
+///
+/// # Errors
+/// Returns an IO error if the runtime cannot register a signal handler.
+pub fn install_cancel() -> io::Result<Cancel> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut hangup = signal(SignalKind::hangup())?;
+        Ok(Box::pin(async move {
+            tokio::select! {
+                _ = interrupt.recv() => {},
+                _ = terminate.recv() => {},
+                _ = hangup.recv() => {},
+            }
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(Box::pin(async {
+            let _ = tokio::signal::ctrl_c().await;
+        }))
+    }
+}
+
+async fn list_conversations(state_dir: &std::path::Path, id: &str) -> Result<String, AppError> {
+    use crabber::session::Store;
+    use std::fmt::Write;
+    let Some(store) = crate::store::connect_existing(state_dir, id).await? else {
+        return Ok(String::new());
+    };
+    let mut cursor = None;
+    let mut output = String::new();
+    loop {
+        let page = store
+            .list_sessions(crabber::ListSessions {
+                workspace_id: id.into(),
+                include_archived: false,
+                limit: 100,
+                cursor,
+            })
+            .await
+            .map_err(|_| AppError::List)?;
+        for session in page.sessions {
+            let timestamp = session
+                .updated_at
+                .to_offset(time::UtcOffset::UTC)
+                .format(&time::format_description::well_known::Rfc3339)
+                .map_err(|_| AppError::List)?;
+            writeln!(output, "{}\t{timestamp}", session.session_id).map_err(|_| AppError::List)?;
+        }
+        cursor = page.next;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(output)
 }

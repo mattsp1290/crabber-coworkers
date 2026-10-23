@@ -29,3 +29,5 @@ rustc-ice-*.txt
 /config.json
 .env
 .env.*
+
+/state/
