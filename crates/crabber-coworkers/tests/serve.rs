@@ -532,3 +532,74 @@ async fn all_tokens_are_checked_before_authentication() {
     assert_eq!(fake.requests().len(), 0);
     assert!(!dir.path().join("state").exists());
 }
+
+#[tokio::test]
+async fn backlog_keeps_arrival_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = config(dir.path(), 10);
+    let fake = FakeSlack::start(identity()).await;
+    let provider = Gated::new();
+    let service = launch(&path, &fake, provider.clone(), &["scout"]);
+    send(&fake, "e1", "1.000001", None, "first").await;
+    wait_until(|| provider.requests().len() == 1).await;
+    for (id, text) in [("e2", "second"), ("e3", "third"), ("e4", "fourth")] {
+        send(&fake, id, "1.000002", Some("1.000001"), text).await;
+    }
+    wait_until(|| fake.acks().len() == 4).await;
+    for (index, text) in ["first", "second", "third", "fourth"]
+        .into_iter()
+        .enumerate()
+    {
+        wait_until(|| provider.requests().len() == index + 1).await;
+        assert_eq!(
+            texts(&provider.requests()[index]).last().unwrap(),
+            &(Role::User, text.into())
+        );
+        provider.release();
+        wait_until(|| fake.posted().len() == index + 1).await;
+    }
+    assert_eq!(service.stop().await.0, 0);
+}
+
+#[tokio::test]
+async fn reconnect_preserves_dedup_and_thread_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = config(dir.path(), 10);
+    let fake = FakeSlack::start(identity()).await;
+    let provider = provider();
+    let service = launch(&path, &fake, provider.clone(), &["scout"]);
+    let event = mention("e1", "T1", "C1", "U1", "1.000001", None, "first");
+    fake.send(event.clone()).await;
+    wait_until(|| fake.posted().len() == 1).await;
+    fake.drop_socket();
+    wait_until(|| fake.connections() == 2).await;
+    fake.send(event).await; // Even an unmarked duplicate must be ignored.
+    wait_until(|| fake.acks().len() == 2).await;
+    assert_eq!(provider.requests().len(), 1);
+    send(&fake, "e2", "1.000002", Some("1.000001"), "second").await;
+    wait_until(|| fake.posted().len() == 2).await;
+    assert_eq!(texts(&provider.requests()[1]).len(), 3);
+    assert_eq!(service.stop().await.0, 0);
+}
+
+#[tokio::test]
+async fn stopping_during_delivery_is_not_a_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = config(dir.path(), 10);
+    let fake = FakeSlack::start(identity()).await;
+    fake.fail_next("chat.postMessage", "ratelimited", 30);
+    let service = launch(&path, &fake, provider(), &["scout"]);
+    send(&fake, "e1", "1.000001", None, "hello").await;
+    wait_until(|| {
+        fake.requests()
+            .iter()
+            .any(|r| r.method == "chat.postMessage")
+    })
+    .await;
+    let (code, log) = service.stop().await;
+    assert_eq!(code, 0);
+    assert!(!log.contains("Slack delivery failed"));
+    assert!(log.ends_with("stopped\n"));
+    assert_eq!(fake.posted().len(), 0);
+    ask_again(&path).await;
+}

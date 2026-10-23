@@ -21,7 +21,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{Semaphore, mpsc, watch},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch},
     task::{JoinHandle, JoinSet},
     time::Instant,
 };
@@ -103,7 +103,11 @@ struct Runtime {
 impl Runtime {
     fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
         let mut workers = self.workers.lock().expect("worker set poisoned");
-        while workers.try_join_next().is_some() {}
+        while let Some(result) = workers.try_join_next() {
+            if result.is_err() {
+                let _ = self.log.send("Slack worker failed".into());
+            }
+        }
         workers.spawn(future);
     }
 }
@@ -212,22 +216,13 @@ pub(crate) async fn run(
         ));
     }
     let mut sockets = JoinSet::new();
+    let mut socket_names = HashMap::new();
     for (coworker, url) in ready {
-        sockets.spawn(coworker_loop(coworker, url));
+        let name = coworker.id().to_owned();
+        let task = sockets.spawn(coworker_loop(coworker, url));
+        socket_names.insert(task.id(), name);
     }
-    let outcome = loop {
-        tokio::select! {
-            biased;
-            () = stop_future(stop.clone()) => break Ok(()),
-            result = sockets.join_next() => match result {
-                Some(Ok(Err(error))) => break Err(error),
-                Some(Err(_)) => break Err(ServeError::Connection(config.slack_coworkers().next().expect("validated").id.clone())),
-                Some(Ok(Ok(()))) => {},
-                None => break Ok(()),
-            },
-            Some(line) = logs.recv() => { let _ = writeln!(err, "{line}"); },
-        }
-    };
+    let outcome = supervise(&mut sockets, &socket_names, stop.clone(), &mut logs, err).await;
     shutdown(&stop_tx, &mut sockets, &runtime).await;
     while let Ok(line) = logs.try_recv() {
         let _ = writeln!(err, "{line}");
@@ -236,6 +231,28 @@ pub(crate) async fn run(
         let _ = writeln!(err, "stopped");
     }
     outcome
+}
+
+async fn supervise(
+    sockets: &mut JoinSet<Result<(), ServeError>>,
+    socket_names: &HashMap<tokio::task::Id, String>,
+    stop: Stop,
+    logs: &mut mpsc::UnboundedReceiver<String>,
+    err: &mut (dyn Write + Send),
+) -> Result<(), ServeError> {
+    loop {
+        tokio::select! {
+            biased;
+            () = stop_future(stop.clone()) => break Ok(()),
+            result = sockets.join_next_with_id() => match result {
+                Some(Ok((_, Err(error)))) => break Err(error),
+                Some(Err(error)) => break Err(ServeError::Connection(socket_names[&error.id()].clone())),
+                Some(Ok((id, Ok(())))) => { let _ = id; },
+                None => break Ok(()),
+            },
+            Some(line) = logs.recv() => { let _ = writeln!(err, "{line}"); },
+        }
+    }
 }
 
 async fn shutdown(
@@ -251,12 +268,17 @@ async fn shutdown(
             let mut set = runtime.workers.lock().expect("worker set poisoned");
             std::mem::take(&mut *set)
         };
-        while workers.join_next().await.is_some() {}
+        while let Some(result) = workers.join_next().await {
+            if result.is_err() {
+                let _ = runtime.log.send("Slack worker failed".into());
+            }
+        }
     };
     if tokio::time::timeout(Duration::from_secs(SHUTDOWN_SECONDS), finish)
         .await
         .is_err()
     {
+        let _ = runtime.log.send("Slack shutdown timed out".into());
         sockets.abort_all();
         runtime
             .workers
@@ -291,10 +313,33 @@ async fn coworker_loop(coworker: Arc<Coworker>, url: url::Url) -> Result<(), Ser
     }
 }
 
-struct Thread {
-    sender: mpsc::Sender<Mention>,
+#[derive(Debug)]
+struct QueuedMention {
+    mention: Mention,
+    // Shared across idle-worker generations; released when processing starts.
+    slot: OwnedSemaphorePermit,
+}
+struct Admission {
+    slots: Arc<Semaphore>,
     last_busy_notice: Option<Instant>,
+}
+struct Thread {
+    sender: mpsc::Sender<QueuedMention>,
+    admission: Admission,
     finished: Stop,
+}
+impl Thread {
+    fn finished(&self) -> bool {
+        *self.finished.borrow() || self.finished.has_changed().is_err()
+    }
+    fn keep(&self) -> bool {
+        !self.sender.is_closed()
+            || !self.finished()
+            || self
+                .admission
+                .last_busy_notice
+                .is_some_and(|last| last.elapsed() < Duration::from_secs(BUSY_NOTICE_SECONDS))
+    }
 }
 struct Handler {
     coworker: Arc<Coworker>,
@@ -316,7 +361,7 @@ impl Handler {
         ) else {
             return Some(envelope.id);
         };
-        if envelope.retry_attempt > 0 && self.recent.contains(&mention.event_id) {
+        if self.recent.contains(&mention.event_id) {
             return Some(envelope.id);
         }
         if self.recent.insert(mention.event_id.clone()) {
@@ -333,31 +378,34 @@ impl Handler {
         };
         // A closed receiver can still be draining accepted mentions. Keep its
         // completion fence until that worker has actually exited.
-        self.threads.retain(|_, thread| {
-            !thread.sender.is_closed()
-                || (!*thread.finished.borrow() && thread.finished.has_changed().is_ok())
-        });
+        self.threads.retain(|_, thread| thread.keep());
         let thread = self
             .threads
             .entry(name.clone())
             .or_insert_with(|| spawn_thread(&self.coworker, name.clone(), None));
-        match thread.sender.try_send(mention) {
+        let Ok(slot) = thread.admission.slots.clone().try_acquire_owned() else {
+            busy_notice(&self.coworker, thread, mention);
+            return Some(envelope.id);
+        };
+        let queued = QueuedMention { mention, slot };
+        match thread.sender.try_send(queued) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Closed(mention)) => {
-                *thread = spawn_thread(&self.coworker, name, Some(thread.finished.clone()));
+                let admission = Admission {
+                    slots: thread.admission.slots.clone(),
+                    last_busy_notice: thread.admission.last_busy_notice,
+                };
+                *thread = spawn_thread_with_admission(
+                    &self.coworker,
+                    name,
+                    Some(thread.finished.clone()),
+                    admission,
+                );
                 let _ = thread.sender.try_send(mention);
             }
-            Err(mpsc::error::TrySendError::Full(mention)) => {
-                if thread
-                    .last_busy_notice
-                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(BUSY_NOTICE_SECONDS))
-                {
-                    thread.last_busy_notice = Some(Instant::now());
-                    let coworker = self.coworker.clone();
-                    self.coworker.runtime.spawn(async move {
-                        notice(&coworker, &mention, BUSY_NOTICE).await;
-                    });
-                }
+            Err(mpsc::error::TrySendError::Full(queued)) => {
+                drop(queued.slot);
+                busy_notice(&self.coworker, thread, queued.mention);
             }
         }
         Some(envelope.id)
@@ -365,6 +413,37 @@ impl Handler {
 }
 
 fn spawn_thread(coworker: &Arc<Coworker>, name: String, predecessor: Option<Stop>) -> Thread {
+    spawn_thread_with_admission(
+        coworker,
+        name,
+        predecessor,
+        Admission {
+            slots: Arc::new(Semaphore::new(THREAD_QUEUE)),
+            last_busy_notice: None,
+        },
+    )
+}
+
+fn busy_notice(coworker: &Arc<Coworker>, thread: &mut Thread, mention: Mention) {
+    if thread
+        .admission
+        .last_busy_notice
+        .is_none_or(|last| last.elapsed() >= Duration::from_secs(BUSY_NOTICE_SECONDS))
+    {
+        thread.admission.last_busy_notice = Some(Instant::now());
+        let worker = coworker.clone();
+        coworker.runtime.spawn(async move {
+            notice(&worker, &mention, BUSY_NOTICE).await;
+        });
+    }
+}
+
+fn spawn_thread_with_admission(
+    coworker: &Arc<Coworker>,
+    name: String,
+    predecessor: Option<Stop>,
+    admission: Admission,
+) -> Thread {
     let (sender, receiver) = mpsc::channel(THREAD_QUEUE);
     let (finished_tx, finished) = watch::channel(false);
     let worker = coworker.clone();
@@ -383,12 +462,16 @@ fn spawn_thread(coworker: &Arc<Coworker>, name: String, predecessor: Option<Stop
     });
     Thread {
         sender,
-        last_busy_notice: None,
+        admission,
         finished,
     }
 }
 
-async fn thread_worker(coworker: Arc<Coworker>, name: String, mut queue: mpsc::Receiver<Mention>) {
+async fn thread_worker(
+    coworker: Arc<Coworker>,
+    name: String,
+    mut queue: mpsc::Receiver<QueuedMention>,
+) {
     let mut stop = stop_future(coworker.runtime.stop.clone());
     let mut draining = false;
     loop {
@@ -416,6 +499,8 @@ async fn thread_worker(coworker: Arc<Coworker>, name: String, mut queue: mpsc::R
                 },
             }
         };
+        let QueuedMention { mention, slot } = mention;
+        drop(slot);
         if !process_mention(&coworker, &name, &mention).await {
             break;
         }
@@ -535,12 +620,15 @@ mod tests {
         let thread = spawn_thread(&coworker, "slack-c1-1-000001".into(), Some(predecessor));
         thread
             .sender
-            .try_send(Mention {
-                event_id: "e2".into(),
-                channel: "C1".into(),
-                root_ts: "1.000001".into(),
-                user: "U1".into(),
-                text: "next".into(),
+            .try_send(QueuedMention {
+                slot: thread.admission.slots.clone().try_acquire_owned().unwrap(),
+                mention: Mention {
+                    event_id: "e2".into(),
+                    channel: "C1".into(),
+                    root_ts: "1.000001".into(),
+                    user: "U1".into(),
+                    text: "next".into(),
+                },
             })
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -557,6 +645,150 @@ mod tests {
         assert_eq!(provider.requests().len(), 1);
     }
 
+    async fn test_coworker() -> (Arc<Coworker>, tempfile::TempDir, watch::Sender<bool>) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../../../config.example.json")).unwrap();
+        value["coworkers"][0]["slack"] = serde_json::json!({"team_id":"T1","allowed_channel_ids":["C1"],"allowed_user_ids":["U1"]});
+        let config: Config = serde_json::from_value(value).unwrap();
+        let (stop_tx, stop) = watch::channel(false);
+        let (log, _) = mpsc::unbounded_channel();
+        let runtime = Arc::new(Runtime {
+            resolver: Arc::new(crabber::FakeProvider::scripted(vec![])),
+            selection: Selection {
+                provider_id: "fake".into(),
+                model_id: "scripted".into(),
+            },
+            permits: Semaphore::new(0),
+            stop,
+            log,
+            workers: Mutex::new(JoinSet::new()),
+        });
+        let coworker = Arc::new(Coworker {
+            config: Arc::new(config),
+            index: 0,
+            api: Arc::new(
+                SlackApi::new(
+                    "http://127.0.0.1:9/",
+                    slack::Credentials::new("xoxb-test".into(), "xapp-test".into()).unwrap(),
+                )
+                .unwrap(),
+            ),
+            identity: Identity {
+                team_id: "T1".into(),
+                user_id: "UBOT".into(),
+                bot_id: "B1".into(),
+            },
+            store: store::open(directory.path(), "scout").await.unwrap(),
+            runtime,
+        });
+        (coworker, directory, stop_tx)
+    }
+
+    fn test_mention(id: &str) -> Mention {
+        Mention {
+            event_id: id.into(),
+            channel: "C1".into(),
+            root_ts: "1.000001".into(),
+            user: "U1".into(),
+            text: "next".into(),
+        }
+    }
+    fn inbound(id: &str) -> Inbound {
+        Inbound::Envelope(socket::Envelope {
+            id: id.into(),
+            retry_attempt: 0,
+            payload: serde_json::json!({"type":"event_callback","team_id":"T1","event_id":id,
+                "event":{"type":"app_mention","channel":"C1","user":"U1","ts":"1.000001","text":"next"}}),
+        })
+    }
+
+    #[tokio::test]
+    async fn idle_generations_share_queue_capacity_and_busy_clock() {
+        let (coworker, _directory, stop) = test_coworker().await;
+        let slots = Arc::new(Semaphore::new(THREAD_QUEUE));
+        let (sender, mut predecessor_queue) = mpsc::channel(THREAD_QUEUE);
+        for i in 0..THREAD_QUEUE {
+            sender
+                .try_send(QueuedMention {
+                    mention: test_mention(&format!("old{i}")),
+                    slot: slots.clone().try_acquire_owned().unwrap(),
+                })
+                .unwrap();
+        }
+        predecessor_queue.close();
+        let (_finished, finished) = watch::channel(false);
+        let last = Instant::now();
+        let thread = Thread {
+            sender,
+            finished,
+            admission: Admission {
+                slots: slots.clone(),
+                last_busy_notice: Some(last),
+            },
+        };
+        let mut handler = Handler {
+            coworker: coworker.clone(),
+            recent: HashSet::new(),
+            order: VecDeque::new(),
+            threads: HashMap::from([("slack-c1-1-000001".into(), thread)]),
+        };
+        assert_eq!(handler.handle(inbound("overflow")), Some("overflow".into()));
+        assert_eq!(slots.available_permits(), 0);
+        drop(predecessor_queue.try_recv().unwrap());
+        // A Closed send creates a successor with the same four-slot budget.
+        handler.handle(inbound("successor"));
+        let thread = &handler.threads["slack-c1-1-000001"];
+        assert!(!thread.sender.is_closed());
+        assert_eq!(slots.available_permits(), 0);
+        assert_eq!(thread.admission.last_busy_notice, Some(last));
+        handler.handle(inbound("overflow-again"));
+        assert_eq!(
+            handler.threads["slack-c1-1-000001"]
+                .admission
+                .last_busy_notice,
+            Some(last)
+        );
+        // Expiry re-arms the same busy clock, even while the old generation drains.
+        handler
+            .threads
+            .get_mut("slack-c1-1-000001")
+            .unwrap()
+            .admission
+            .last_busy_notice = Some(Instant::now() - Duration::from_secs(BUSY_NOTICE_SECONDS + 1));
+        handler.handle(inbound("overflow-after-expiry"));
+        assert!(
+            handler.threads["slack-c1-1-000001"]
+                .admission
+                .last_busy_notice
+                .unwrap()
+                >= last
+        );
+        shutdown(&stop, &mut JoinSet::new(), &coworker.runtime).await;
+        drop(predecessor_queue);
+        assert_eq!(slots.available_permits(), THREAD_QUEUE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_aborts_stalled_tasks_with_a_fixed_log() {
+        let (stop_tx, stop) = watch::channel(false);
+        let (log, mut logs) = mpsc::unbounded_channel();
+        let runtime = Runtime {
+            resolver: Arc::new(crabber::FakeProvider::scripted(vec![])),
+            selection: Selection {
+                provider_id: "fake".into(),
+                model_id: "scripted".into(),
+            },
+            permits: Semaphore::new(1),
+            stop,
+            log,
+            workers: Mutex::new(JoinSet::new()),
+        };
+        runtime.spawn(std::future::pending());
+        shutdown(&stop_tx, &mut JoinSet::new(), &runtime).await;
+        assert_eq!(logs.try_recv().unwrap(), "Slack shutdown timed out");
+        assert!(runtime.workers.lock().unwrap().is_empty());
+    }
     #[test]
     fn ask_future_is_send() {
         fn assert_send<T: Send>(_: T) {}

@@ -7,6 +7,8 @@ use tokio::{sync::mpsc, time::Instant};
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 pub const STALE_AFTER: Duration = Duration::from_secs(120);
 pub const STABLE_SESSION: Duration = Duration::from_secs(30);
 pub const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -57,14 +59,19 @@ where
         };
         match url {
             Err(ApiError::Auth | ApiError::Rejected) => return Err(SocketError::Auth),
-            Err(ApiError::Transport | ApiError::RateLimited { .. }) => {}
+            Err(ApiError::RateLimited {
+                retry_after_seconds,
+            }) => {
+                backoff = backoff.max(Duration::from_secs(retry_after_seconds));
+            }
+            Err(ApiError::Transport) => {}
             Ok(url) => {
                 let connection = tokio::select! {
                     biased;
                     () = &mut stop => return Ok(()),
-                    result = tokio_tungstenite::connect_async(url.as_str()) => result,
+                    result = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(url.as_str())) => result,
                 };
-                if let Ok((mut socket, _)) = connection {
+                if let Ok(Ok((mut socket, _))) = connection {
                     let started = Instant::now();
                     if session(&mut socket, &mut stop, &mut handle).await? {
                         return Ok(());
@@ -148,9 +155,9 @@ where
                 let flushed = tokio::select! {
                     biased;
                     () = &mut *stop => return Ok(true),
-                    result = socket.flush() => result,
+                    result = tokio::time::timeout(SEND_TIMEOUT, socket.flush()) => result,
                 };
-                if flushed.is_err() {
+                if !matches!(flushed, Ok(Ok(()))) {
                     break;
                 }
                 None
@@ -162,9 +169,9 @@ where
             let sent = tokio::select! {
                 biased;
                 () = &mut *stop => return Ok(true),
-                result = socket.send(Message::Text(json!({"envelope_id":id}).to_string().into())) => result,
+                result = tokio::time::timeout(SEND_TIMEOUT, socket.send(Message::Text(json!({"envelope_id":id}).to_string().into()))) => result,
             };
-            if sent.is_err() {
+            if !matches!(sent, Ok(Ok(()))) {
                 break;
             }
         }

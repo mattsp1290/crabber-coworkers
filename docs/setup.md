@@ -145,9 +145,13 @@ SIGINT, SIGTERM, or SIGHUP stops intake, drops queued mentions, interrupts activ
 | `Slack reconnecting for <id>` | stderr log |
 | `Slack delivery failed for <id>` | stderr log |
 | `Slack event ignored for <id>` | stderr log |
+| `Slack worker failed` | stderr log; worker task ended unexpectedly |
+| `Slack shutdown timed out` | stderr log; remaining tasks aborted |
 
 The transport's library errors are fixed categories: `Slack authentication failed`, `Slack rate limited`, `Slack request failed`, `Slack rejected the request`, and `Slack disabled the Socket Mode link`. The daemon maps them to the coworker-specific messages above. Slack notices are listed in [Slack setup](slack-setup.md).
 
 Acknowledged mentions awaiting an answer are lost if `serve` crashes. Deduplication holds only the last 1,024 accepted event IDs in memory per coworker; redelivery after a restart can be answered twice. A chunk with an unknown delivery outcome is never retried, so a reply can have a missing tail. SIGKILL during a model turn can leave the thread's conversation busy with no automatic recovery; a new root mention starts a usable conversation.
 
 An operator-named conversation starting with `slack-` can collide with a generated name. Using a thread's conversation simultaneously through `serve` and `ask --conversation` reports busy to whichever comes second. When two coworkers are mentioned under one root message, both answer there and keep separate histories in their respective coworker stores.
+
+Stopping cancels delivery, including a rate-limit wait, without logging a delivery failure. An answer already committed to history may therefore be undelivered or only partly delivered when the process stops. A shutdown that exceeds the 20-second budget aborts remaining tasks and can leave a conversation busy, like a hard crash.

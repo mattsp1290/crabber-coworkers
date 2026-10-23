@@ -22,7 +22,10 @@ fn boundary(text: &str, cap: usize, prefer_newline: bool) -> usize {
         {
             end = amp;
         }
-        if prefer_newline && let Some(newline) = text[..end].rfind('\n') {
+        if prefer_newline
+            && let Some(newline) = text[..end].rfind('\n')
+            && newline + 1 >= end / 2
+        {
             end = newline + 1;
         }
     }
@@ -49,19 +52,28 @@ pub fn chunks(mut escaped: &str) -> Vec<String> {
     chunks
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeliveryOutcome {
+    Complete,
+    Stopped,
+}
+
 /// # Errors
-/// Returns the first failed chunk's fixed error category, or Transport on cancellation.
+/// Returns the first failed chunk's fixed error category. Cancellation is a normal outcome.
 pub async fn post_answer(
     api: &SlackApi,
     channel: &str,
     root_ts: &str,
     answer: &str,
     stop: &mut Cancel,
-) -> Result<(), ApiError> {
+) -> Result<DeliveryOutcome, ApiError> {
     for chunk in chunks(&escape(answer)) {
+        if chunk.trim().is_empty() {
+            continue;
+        }
         let result = tokio::select! {
             biased;
-            () = &mut *stop => return Err(ApiError::Transport),
+            () = &mut *stop => return Ok(DeliveryOutcome::Stopped),
             result = api.post_message(channel, root_ts, &chunk) => result,
         };
         if let Err(ApiError::RateLimited {
@@ -70,17 +82,44 @@ pub async fn post_answer(
         {
             tokio::select! {
                 biased;
-                () = &mut *stop => return Err(ApiError::Transport),
+                () = &mut *stop => return Ok(DeliveryOutcome::Stopped),
                 () = tokio::time::sleep(Duration::from_secs(retry_after_seconds)) => {},
             }
             tokio::select! {
                 biased;
-                () = &mut *stop => return Err(ApiError::Transport),
+                () = &mut *stop => return Ok(DeliveryOutcome::Stopped),
                 result = api.post_message(channel, root_ts, &chunk) => result?,
             }
         } else {
             result?;
         }
     }
-    Ok(())
+    Ok(DeliveryOutcome::Complete)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn early_newline_does_not_consume_a_chunk() {
+        let input = "\n".to_owned() + &"x".repeat(4_000);
+        let parts = chunks(&input);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].chars().count(), CHUNK_CHARS);
+        assert_eq!(parts.concat(), input);
+    }
+
+    #[test]
+    fn newline_preference_preserves_unicode_entity_boundaries() {
+        let input = escape(&("🦀".repeat(2_000) + "\n" + &"&".repeat(1_000)));
+        let parts = chunks(&input);
+        assert_eq!(parts.concat(), input);
+        assert!(parts.iter().all(|p| p.chars().count() <= CHUNK_CHARS));
+        assert!(
+            parts
+                .iter()
+                .all(|p| p.rfind('&').is_none_or(|amp| p[amp..].contains(';')))
+        );
+    }
 }

@@ -90,6 +90,9 @@ impl SlackApi {
                     .unwrap_or(1)
                     .min(30),
             },
+            Some("internal_error" | "fatal_error" | "service_unavailable" | "request_timeout") => {
+                ApiError::Transport
+            }
             _ => ApiError::Rejected,
         })
     }
@@ -126,7 +129,7 @@ impl SlackApi {
             .await?;
         let url = Url::parse(value["url"].as_str().ok_or(ApiError::Transport)?)
             .map_err(|_| ApiError::Transport)?;
-        if !matches!(url.scheme(), "ws" | "wss") {
+        if !allowed_socket_scheme(self.base.scheme(), url.scheme()) {
             return Err(ApiError::Transport);
         }
         Ok(url)
@@ -150,5 +153,22 @@ impl SlackApi {
         )
         .await?;
         Ok(())
+    }
+}
+
+// Plaintext is reserved for explicitly injected HTTP test servers.
+fn allowed_socket_scheme(base: &str, socket: &str) -> bool {
+    socket == "wss" || (base == "http" && socket == "ws")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn production_socket_cannot_downgrade_tls() {
+        assert!(allowed_socket_scheme("https", "wss"));
+        assert!(!allowed_socket_scheme("https", "ws"));
+        assert!(allowed_socket_scheme("http", "ws"));
+        assert!(!allowed_socket_scheme("http", "https"));
     }
 }

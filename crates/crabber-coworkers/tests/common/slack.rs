@@ -32,7 +32,7 @@ struct State {
     posted: Vec<Posted>,
     requests: Vec<Request>,
     acks: Vec<String>,
-    failures: HashMap<String, VecDeque<(String, u64)>>,
+    failures: HashMap<String, VecDeque<(String, u64, u64)>>,
     connections: usize,
     opens: usize,
     stall_auth: bool,
@@ -146,7 +146,16 @@ impl FakeSlack {
             .failures
             .entry(method.into())
             .or_default()
-            .push_back((error.into(), seconds));
+            .push_back((error.into(), seconds, seconds));
+    }
+    pub fn fail_next_with_retry(&self, method: &str, header: u64, body: u64) {
+        self.state
+            .lock()
+            .unwrap()
+            .failures
+            .entry(method.into())
+            .or_default()
+            .push_back(("ratelimited".into(), header, body));
     }
     pub fn stall_auth(&self) {
         self.state.lock().unwrap().stall_auth = true;
@@ -257,8 +266,8 @@ fn http_server(
                             state.requests.push(Request { method: method.into(), bearer: bearer.clone(), body: body.clone() });
                             if method == "apps.connections.open" { state.opens += 1; }
                             let failure = state.failures.get_mut(method).and_then(VecDeque::pop_front);
-                            if let Some((error, seconds)) = failure {
-                                (json!({"ok":false,"error":error,"retry_after":seconds}), seconds, false)
+                            if let Some((error, header, body)) = failure {
+                                (json!({"ok":false,"error":error,"retry_after":body}), header, false)
                             } else {
                                 let value = match method {
                                     "auth.test" => json!({"ok":true,"team_id":team,"user_id":user,"bot_id":bot}),

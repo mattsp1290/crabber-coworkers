@@ -255,7 +255,12 @@ fn classify_matrix() {
         ));
     }
     for thread in [None, Some("1.000001")] {
-        let payload = mention("e1", "T1", "C1", "U1", "1.000001", thread, "<@UBOT> hello");
+        let ts = if thread.is_some() {
+            "1.000002"
+        } else {
+            "1.000001"
+        };
+        let payload = mention("e1", "T1", "C1", "U1", ts, thread, "<@UBOT> hello");
         let Classified::Mention(event) =
             ingress::classify(&config(), &identity(), &payload["payload"])
         else {
@@ -370,7 +375,7 @@ async fn post_answer_retries_rate_limit_once() {
         )
         .await
         .unwrap(),
-        Err(ApiError::Transport)
+        Ok(delivery::DeliveryOutcome::Stopped)
     );
     sender.await.unwrap();
     assert_eq!(fake.posted().len(), 1);
@@ -407,4 +412,92 @@ async fn socket_transport_failure_reconnects_until_cancelled() {
             .unwrap(),
         Ok(())
     );
+}
+
+#[tokio::test]
+async fn transient_slack_errors_retry_reconnect() {
+    for error in [
+        "internal_error",
+        "fatal_error",
+        "service_unavailable",
+        "request_timeout",
+    ] {
+        let fake = FakeSlack::start(identity()).await;
+        let (tx, stop) = cancel();
+        let (log, _) = mpsc::unbounded_channel();
+        let task = tokio::spawn(socket::run(api(&fake), None, stop, log, |_| None));
+        wait_until(|| fake.connections() == 1).await;
+        fake.fail_next("apps.connections.open", error, 1);
+        fake.drop_socket();
+        wait_until(|| fake.connections() == 2).await;
+        tx.send(()).unwrap();
+        task.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn stalled_upgrade_times_out_and_reconnects() {
+    let fake = FakeSlack::start(identity()).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first = url::Url::parse(&format!("ws://{}/", listener.local_addr().unwrap())).unwrap();
+    let (accepted, connected) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.unwrap();
+        accepted.send(()).unwrap();
+        std::future::pending::<()>().await;
+    });
+    let (tx, stop) = cancel();
+    let (log, mut logs) = mpsc::unbounded_channel();
+    let task = tokio::spawn(socket::run(api(&fake), Some(first), stop, log, |_| None));
+    tokio::time::timeout(Duration::from_secs(2), connected)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::pause();
+    tokio::time::advance(socket::CONNECT_TIMEOUT).await;
+    tokio::time::resume();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), logs.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        "Slack reconnecting"
+    );
+    wait_until(|| fake.connections() == 1).await;
+    tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn retry_after_header_precedes_body() {
+    let fake = FakeSlack::start(identity()).await;
+    fake.fail_next_with_retry("auth.test", 2, 9);
+    assert_eq!(
+        api(&fake).auth_test().await.err(),
+        Some(ApiError::RateLimited {
+            retry_after_seconds: 2
+        })
+    );
+}
+
+#[tokio::test]
+async fn reconnect_honors_retry_after() {
+    let fake = FakeSlack::start(identity()).await;
+    let (tx, stop) = cancel();
+    let (log, _) = mpsc::unbounded_channel();
+    let task = tokio::spawn(socket::run(api(&fake), None, stop, log, |_| None));
+    wait_until(|| fake.connections() == 1).await;
+    fake.fail_next("apps.connections.open", "ratelimited", 3);
+    fake.drop_socket();
+    wait_until(|| fake.opens() == 2).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert_eq!(fake.opens(), 2);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::time::resume();
+    wait_until(|| fake.connections() == 2).await;
+    tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
 }
