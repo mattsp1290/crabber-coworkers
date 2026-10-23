@@ -8,7 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-crabber = { git = "ssh://git@github.com/mattsp1290/crabber.git", rev = "883189465397b2fd326a6ef358c8a2fbd39fbec8", features = ["opencode-go"] }
+crabber = { git = "ssh://git@github.com/mattsp1290/crabber.git", rev = "a32b1a83bce10649b56498d7967ab3383490aa51", features = ["opencode-go", "sqlite"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

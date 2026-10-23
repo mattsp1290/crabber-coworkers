@@ -1,3 +1,5 @@
+pub const BEHAVIOR_VERSION: &str = "crabber-coworkers.v1";
+
 pub const PROVIDER_ID: &str = "opencode-go";
 pub const MODEL_ID: &str = "deepseek-v4-flash";
 pub const API_KEY_ENV: &str = "OPENCODE_GO_API_KEY";
@@ -29,6 +31,7 @@ pub fn build_agent(
     selection: Selection,
 ) -> Result<Agent, BuildError> {
     Agent::builder()
+        .behavior_version(BEHAVIOR_VERSION)
         .store(store)
         .provider(resolver)
         .config(AgentConfig {
@@ -38,6 +41,8 @@ pub fn build_agent(
             directory: ".".into(),
             title: def.name.clone(),
             system_prompt: Some(system_prompt(def)),
+            max_output_tokens: None,
+            model_controls: crabber::ModelControls::default(),
         })
         .policy(Arc::new(StaticPolicy::new(PermissionDecision::Deny)))
         .build()

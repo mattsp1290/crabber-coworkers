@@ -26,6 +26,28 @@ pub fn failure(retryable: bool) -> StreamDelta {
 pub struct Pending;
 #[async_trait]
 impl Resolver for Pending {
+    fn binding_descriptor(
+        &self,
+        selection: &Selection,
+    ) -> Result<crabber::core::ProviderBindingDescriptor, crabber::providers::ProviderBindingError>
+    {
+        crabber::core::ProviderBindingDescriptor::new(
+            &selection.provider_id,
+            &selection.model_id,
+            "crabber-coworkers.pending",
+            "1",
+            crabber::InputFingerprint::new(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            )
+            .expect("constant digest is valid"),
+            crabber::core::ProviderBindingLimits {
+                context_tokens: None,
+                output_tokens: None,
+            },
+        )
+        .map_err(|_| crabber::providers::ProviderBindingError::InvalidDescriptor)
+    }
+
     async fn resolve(&self, _: &Selection) -> Result<Arc<dyn Streamer>, ProviderError> {
         Ok(Arc::new(Self))
     }

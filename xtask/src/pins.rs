@@ -1,1 +1,1 @@
-pub const CRABBER_REV: &str = "883189465397b2fd326a6ef358c8a2fbd39fbec8";
+pub const CRABBER_REV: &str = "a32b1a83bce10649b56498d7967ab3383490aa51";

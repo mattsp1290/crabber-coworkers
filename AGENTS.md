@@ -1,5 +1,5 @@
 - Rust 2024 workspace. Run `cargo xtask check` before handing off a work package.
-- Pin crabber in exactly two places: `crates/crabber-coworkers/Cargo.toml` and `xtask/src/pins.rs`. Keep them equal. When crabber-tools or crabber-extensions are added, keep the pin equal to theirs.
+- Pin crabber in exactly two places: `crates/crabber-coworkers/Cargo.toml` and `xtask/src/pins.rs`. Keep them equal. crabber-tools and crabber-extensions live in the crabber workspace. When adding `crabber-tools-catalog` or `crabber-extensions`, use the same git source and `rev` as `crabber`.
 - Never commit a crabber path override or a `[patch]` section.
 - Import crabber only through the `crabber` facade crate.
 - Tests must run without credentials. Inject providers through the library entry points.
