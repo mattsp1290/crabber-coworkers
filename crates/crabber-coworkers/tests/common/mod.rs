@@ -65,3 +65,17 @@ impl Streamer for Pending {
 pub fn never() -> crabber_coworkers::ask::Cancel {
     Box::pin(std::future::pending())
 }
+
+/// Write an isolated example config with an explicit model-turn limit.
+pub fn write_state_config(
+    directory: &std::path::Path,
+    model_turn_seconds: u64,
+) -> std::path::PathBuf {
+    let mut config: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../config.example.json")).unwrap();
+    config["state_dir"] = serde_json::json!(directory.join("state"));
+    config["limits"]["model_turn_seconds"] = serde_json::json!(model_turn_seconds);
+    let path = directory.join("config.json");
+    std::fs::write(&path, config.to_string()).unwrap();
+    path
+}

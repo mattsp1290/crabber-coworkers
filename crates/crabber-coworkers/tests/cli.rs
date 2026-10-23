@@ -113,19 +113,10 @@ fn check_config_does_not_create_state_dir() {
     assert!(!state.exists());
 }
 
-fn durable_config(temp: &tempfile::TempDir) -> std::path::PathBuf {
-    let mut value: serde_json::Value =
-        serde_json::from_str(include_str!("../../../config.example.json")).unwrap();
-    value["state_dir"] = serde_json::json!(temp.path().join("state"));
-    let file = temp.path().join("config.json");
-    std::fs::write(&file, value.to_string()).unwrap();
-    file
-}
-
 #[test]
 fn ask_conversation_without_key_creates_nothing() {
     let temp = tempfile::tempdir().unwrap();
-    let file = durable_config(&temp);
+    let file = common::write_state_config(temp.path(), 120);
     for (name, id, message) in [
         ("weekly", "scout", "OPENCODE_GO_API_KEY is not set\n"),
         ("Weekly", "scout", "invalid conversation name\n"),
@@ -154,7 +145,7 @@ async fn list_conversations_without_key_while_running() {
     };
     use std::sync::Arc;
     let temp = tempfile::tempdir().unwrap();
-    let file = durable_config(&temp);
+    let file = common::write_state_config(temp.path(), 120);
     let listing = || {
         binary()
             .args(["list-conversations", "--config"])
@@ -216,7 +207,7 @@ async fn listing_wal_snapshot_does_not_change_database_bytes() {
     };
     use std::sync::Arc;
     let temp = tempfile::tempdir().unwrap();
-    let file = durable_config(&temp);
+    let file = common::write_state_config(temp.path(), 120);
     let config = config::load(&file).unwrap();
     let db = store::open(&config.state_dir, "scout").await.unwrap();
     ask(

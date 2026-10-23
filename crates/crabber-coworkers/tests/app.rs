@@ -165,15 +165,6 @@ async fn invalid_requests_never_reach_provider() {
     }
 }
 
-fn durable_config(temp: &tempfile::TempDir) -> std::path::PathBuf {
-    let file = temp.path().join("config.json");
-    let mut json: serde_json::Value =
-        serde_json::from_str(include_str!("../../../config.example.json")).unwrap();
-    json["state_dir"] = serde_json::json!(temp.path().join("state"));
-    json["limits"] = serde_json::json!({"model_turn_seconds":1});
-    std::fs::write(&file, json.to_string()).unwrap();
-    file
-}
 fn conversation_cli(file: &std::path::Path, name: &str) -> Cli {
     Cli::parse_from([
         "crabber-coworkers",
@@ -205,7 +196,7 @@ fn ok_provider() -> Arc<FakeProvider> {
 #[tokio::test]
 async fn ask_with_conversation_round_trip() {
     let temp = tempfile::tempdir().unwrap();
-    let file = durable_config(&temp);
+    let file = common::write_state_config(temp.path(), 1);
     for turn in 0..2 {
         let provider = ok_provider();
         let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -230,7 +221,7 @@ async fn ask_with_conversation_round_trip() {
 #[tokio::test]
 async fn ask_without_conversation_leaves_state_dir_absent() {
     let temp = tempfile::tempdir().unwrap();
-    let file = durable_config(&temp);
+    let file = common::write_state_config(temp.path(), 1);
     let (mut out, mut err) = (Vec::new(), Vec::new());
     assert_eq!(
         run_with(
@@ -252,7 +243,7 @@ async fn ask_without_conversation_leaves_state_dir_absent() {
 #[tokio::test]
 async fn invalid_conversation_exit_2() {
     let temp = tempfile::tempdir().unwrap();
-    let file = durable_config(&temp);
+    let file = common::write_state_config(temp.path(), 1);
     let provider = ok_provider();
     let (mut out, mut err) = (Vec::new(), Vec::new());
     assert_eq!(
@@ -277,7 +268,7 @@ async fn invalid_conversation_exit_2() {
 async fn interrupted_exit_130() {
     for durable in [false, true] {
         let temp = tempfile::tempdir().unwrap();
-        let file = durable_config(&temp);
+        let file = common::write_state_config(temp.path(), 1);
         let command = if durable {
             conversation_cli(&file, "weekly")
         } else {
@@ -321,7 +312,7 @@ async fn interrupted_exit_130() {
 #[tokio::test]
 async fn cancel_before_store_open_starts_nothing() {
     let temp = tempfile::tempdir().unwrap();
-    let file = durable_config(&temp);
+    let file = common::write_state_config(temp.path(), 1);
     let provider = ok_provider();
     let (mut out, mut err) = (Vec::new(), Vec::new());
     assert_eq!(
@@ -345,7 +336,7 @@ async fn cancel_before_store_open_starts_nothing() {
 #[tokio::test]
 async fn list_conversations_lists_names_and_utc() {
     let temp = tempfile::tempdir().unwrap();
-    let file = durable_config(&temp);
+    let file = common::write_state_config(temp.path(), 1);
     for name in ["alpha", "beta"] {
         assert_eq!(
             run_with(
@@ -402,7 +393,7 @@ async fn list_conversations_lists_names_and_utc() {
 #[tokio::test]
 async fn list_conversations_without_store_prints_nothing() {
     let temp = tempfile::tempdir().unwrap();
-    let file = durable_config(&temp);
+    let file = common::write_state_config(temp.path(), 1);
     let provider = ok_provider();
     let (mut out, mut err) = (Vec::new(), Vec::new());
     assert_eq!(
@@ -427,7 +418,7 @@ async fn list_conversations_without_store_prints_nothing() {
 async fn list_conversations_while_running() {
     use crabber_coworkers::{bridge, config, store};
     let temp = tempfile::tempdir().unwrap();
-    let file = durable_config(&temp);
+    let file = common::write_state_config(temp.path(), 1);
     assert_eq!(
         run_with(
             conversation_cli(&file, "weekly"),
