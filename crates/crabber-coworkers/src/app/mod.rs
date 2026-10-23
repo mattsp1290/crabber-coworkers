@@ -1,6 +1,7 @@
 use crate::{
     ask::{AskError, Cancel, Session, ask, validate_request},
     bridge, config,
+    slack::{CredentialSource, api::DEFAULT_BASE},
 };
 use clap::{Parser, Subcommand};
 use crabber::{Selection, providers::Resolver};
@@ -20,6 +21,11 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Answer Slack mentions for every coworker that has a slack block, until a signal arrives.
+    Serve {
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Validate configuration and list coworker IDs and names.
     CheckConfig {
         #[arg(long)]
@@ -50,6 +56,8 @@ pub async fn run(cli: Cli) -> i32 {
         None,
         &mut io::stdout(),
         &mut io::stderr(),
+        CredentialSource::FromEnv,
+        DEFAULT_BASE,
     )
     .await
 }
@@ -69,6 +77,8 @@ pub async fn run_with(
         cancel,
         out,
         err,
+        CredentialSource::FromEnv,
+        DEFAULT_BASE,
     )
     .await
 }
@@ -101,13 +111,13 @@ impl AppError {
     }
 }
 
-enum Provider {
+pub(crate) enum Provider {
     FromEnv,
     Injected(Arc<dyn Resolver>),
 }
 
 impl Provider {
-    fn resolve(self) -> Option<Arc<dyn Resolver>> {
+    pub(crate) fn resolve(self) -> Option<Arc<dyn Resolver>> {
         match self {
             Self::FromEnv => bridge::opencode_go_resolver_from_env(),
             Self::Injected(resolver) => Some(resolver),
@@ -115,6 +125,7 @@ impl Provider {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute(
     cli: Cli,
     provider: Provider,
@@ -122,7 +133,28 @@ async fn execute(
     cancel: Option<Cancel>,
     out: &mut (dyn Write + Send),
     err: &mut (dyn Write + Send),
+    credentials: CredentialSource,
+    slack_base: &str,
 ) -> i32 {
+    if let Command::Serve { config } = cli.command {
+        return match crate::serve::run(
+            config,
+            provider,
+            credentials,
+            selection,
+            cancel,
+            slack_base,
+            err,
+        )
+        .await
+        {
+            Ok(()) => 0,
+            Err(error) => {
+                let _ = writeln!(err, "{error}");
+                error.exit_code()
+            }
+        };
+    }
     match respond(cli, provider, selection, cancel)
         .await
         .and_then(|output| emit(out, &output))
@@ -142,6 +174,7 @@ async fn respond(
     cancel: Option<Cancel>,
 ) -> Result<String, AppError> {
     match cli.command {
+        Command::Serve { .. } => unreachable!("serve is dispatched before respond"),
         Command::CheckConfig { config } => Ok(listing(&config::load(&config)?)),
         Command::ListConversations {
             config,
@@ -261,4 +294,29 @@ async fn list_conversations(state_dir: &std::path::Path, id: &str) -> Result<Str
         }
     }
     Ok(output)
+}
+
+/// Run the production serve dispatch with injected providers, tokens, base URL, and cancellation.
+pub async fn serve_with(
+    config: PathBuf,
+    resolver: Arc<dyn Resolver>,
+    credentials: CredentialSource,
+    selection: Selection,
+    cancel: Cancel,
+    slack_base: &str,
+    err: &mut (dyn Write + Send),
+) -> i32 {
+    execute(
+        Cli {
+            command: Command::Serve { config },
+        },
+        Provider::Injected(resolver),
+        selection,
+        Some(cancel),
+        &mut Vec::new(),
+        err,
+        credentials,
+        slack_base,
+    )
+    .await
 }

@@ -51,6 +51,8 @@ pub struct FakeSlack {
 }
 
 impl FakeSlack {
+    // tungstenite fixes the callback error type to its HTTP response.
+    #[allow(clippy::result_large_err)]
     pub async fn start(identity: Identity) -> Self {
         let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -71,8 +73,12 @@ impl FakeSlack {
                         let state = state_ws.clone();
                         let mut receiver = frames_ws.subscribe();
                         sockets.spawn(async move {
-                            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-                            let index = { let mut s = state.lock().unwrap(); let index = s.connections; s.connections += 1; index };
+                            let mut index = 0;
+                            let mut socket = tokio_tungstenite::accept_hdr_async(stream, |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
+                                index = request.uri().path().trim_matches('/').parse::<usize>().unwrap();
+                                Ok(response)
+                            }).await.unwrap();
+                            state.lock().unwrap().connections += 1;
                             socket.send(Message::Text(json!({"type":"hello"}).to_string().into())).await.unwrap();
                             loop {
                                 tokio::select! {
@@ -256,7 +262,7 @@ fn http_server(
                             } else {
                                 let value = match method {
                                     "auth.test" => json!({"ok":true,"team_id":team,"user_id":user,"bot_id":bot}),
-                                    "apps.connections.open" => json!({"ok":true,"url":if state.invalid_url {"https://invalid/"} else {&ws_url}}),
+                                    "apps.connections.open" => json!({"ok":true,"url":if state.invalid_url {"https://invalid/".into()} else {format!("{ws_url}{}", state.opens - 1)}}),
                                     "chat.postMessage" => {
                                         state.posted.push(Posted {
                                             channel: body["channel"].as_str().unwrap().into(),

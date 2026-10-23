@@ -45,7 +45,7 @@ where
 {
     let mut backoff = Duration::from_secs(1);
     loop {
-        let started = Instant::now();
+        let mut stable = false;
         let url = if let Some(url) = first_url.take() {
             Ok(url)
         } else {
@@ -64,15 +64,17 @@ where
                     () = &mut stop => return Ok(()),
                     result = tokio_tungstenite::connect_async(url.as_str()) => result,
                 };
-                if let Ok((mut socket, _)) = connection
-                    && session(&mut socket, &mut stop, &mut handle).await?
-                {
-                    return Ok(());
+                if let Ok((mut socket, _)) = connection {
+                    let started = Instant::now();
+                    if session(&mut socket, &mut stop, &mut handle).await? {
+                        return Ok(());
+                    }
+                    stable = started.elapsed() >= STABLE_SESSION;
                 }
             }
         }
         let _ = log.send("Slack reconnecting".into());
-        if started.elapsed() >= STABLE_SESSION {
+        if stable {
             backoff = Duration::from_secs(1);
         } else {
             tokio::select! {
