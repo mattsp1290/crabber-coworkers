@@ -8,3 +8,5 @@ pub const MAX_PROMPT_BYTES: usize = 1_048_576;
 pub const MAX_TURN_SECONDS: u64 = 3_600;
 pub const DEFAULT_PROMPT_BYTES: usize = 32_768;
 pub const DEFAULT_TURN_SECONDS: u64 = 120;
+
+pub const MAX_STATE_DIR_BYTES: usize = 4_096;

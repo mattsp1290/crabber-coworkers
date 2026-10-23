@@ -316,6 +316,7 @@ dependencies = [
  "clap",
  "crabber",
  "futures",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

@@ -93,3 +93,21 @@ fn validation_precedes_key_check() {
         assert_eq!(output.stdout, b"");
     }
 }
+
+#[test]
+fn check_config_does_not_create_state_dir() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let mut value: serde_json::Value =
+        serde_json::from_str(include_str!("../../../config.example.json")).unwrap();
+    value["state_dir"] = serde_json::json!(state);
+    let config = temp.path().join("config.json");
+    std::fs::write(&config, value.to_string()).unwrap();
+    let output = binary()
+        .args(["check-config", "--config"])
+        .arg(config)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(!state.exists());
+}

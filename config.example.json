@@ -1,4 +1,5 @@
 {
+  "state_dir": "state",
   "coworkers": [
     {
       "id": "scout",
