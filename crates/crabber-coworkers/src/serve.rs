@@ -391,16 +391,7 @@ impl Handler {
         match thread.sender.try_send(queued) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Closed(mention)) => {
-                let admission = Admission {
-                    slots: thread.admission.slots.clone(),
-                    last_busy_notice: thread.admission.last_busy_notice,
-                };
-                *thread = spawn_thread_with_admission(
-                    &self.coworker,
-                    name,
-                    Some(thread.finished.clone()),
-                    admission,
-                );
+                *thread = spawn_thread(&self.coworker, name, Some(thread));
                 let _ = thread.sender.try_send(mention);
             }
             Err(mpsc::error::TrySendError::Full(queued)) => {
@@ -410,18 +401,6 @@ impl Handler {
         }
         Some(envelope.id)
     }
-}
-
-fn spawn_thread(coworker: &Arc<Coworker>, name: String, predecessor: Option<Stop>) -> Thread {
-    spawn_thread_with_admission(
-        coworker,
-        name,
-        predecessor,
-        Admission {
-            slots: Arc::new(Semaphore::new(THREAD_QUEUE)),
-            last_busy_notice: None,
-        },
-    )
 }
 
 fn busy_notice(coworker: &Arc<Coworker>, thread: &mut Thread, mention: Mention) {
@@ -438,12 +417,23 @@ fn busy_notice(coworker: &Arc<Coworker>, thread: &mut Thread, mention: Mention) 
     }
 }
 
-fn spawn_thread_with_admission(
-    coworker: &Arc<Coworker>,
-    name: String,
-    predecessor: Option<Stop>,
-    admission: Admission,
-) -> Thread {
+fn spawn_thread(coworker: &Arc<Coworker>, name: String, previous: Option<&Thread>) -> Thread {
+    let (admission, predecessor) = match previous {
+        Some(previous) => (
+            Admission {
+                slots: previous.admission.slots.clone(),
+                last_busy_notice: previous.admission.last_busy_notice,
+            },
+            Some(previous.finished.clone()),
+        ),
+        None => (
+            Admission {
+                slots: Arc::new(Semaphore::new(THREAD_QUEUE)),
+                last_busy_notice: None,
+            },
+            None,
+        ),
+    };
     let (sender, receiver) = mpsc::channel(THREAD_QUEUE);
     let (finished_tx, finished) = watch::channel(false);
     let worker = coworker.clone();
@@ -473,31 +463,19 @@ async fn thread_worker(
     mut queue: mpsc::Receiver<QueuedMention>,
 ) {
     let mut stop = stop_future(coworker.runtime.stop.clone());
-    let mut draining = false;
     loop {
-        let mention = if draining {
-            if *coworker.runtime.stop.borrow() {
-                break;
-            }
-            match queue.try_recv() {
-                Ok(mention) => mention,
-                Err(_) => break,
-            }
-        } else {
-            tokio::select! {
-                biased;
-                () = &mut stop => break,
-                next = tokio::time::timeout(Duration::from_secs(IDLE_SECONDS), queue.recv()) => match next {
-                    Ok(Some(mention)) => mention,
-                    Ok(None) => break,
-                    Err(_) => {
-                        // Close before draining: accepted sends survive, later sends respawn.
-                        queue.close();
-                        draining = true;
-                        continue;
-                    },
+        let mention = tokio::select! {
+            biased;
+            () = &mut stop => break,
+            next = tokio::time::timeout(Duration::from_secs(IDLE_SECONDS), queue.recv()) => match next {
+                Ok(Some(mention)) => mention,
+                Ok(None) => break,
+                Err(_) => {
+                    // Closing preserves accepted sends; recv drains them before None.
+                    queue.close();
+                    continue;
                 },
-            }
+            },
         };
         let QueuedMention { mention, slot } = mention;
         drop(slot);
@@ -617,7 +595,16 @@ mod tests {
         });
         // Represent an idle predecessor whose closed queue is still draining.
         let (drained, predecessor) = watch::channel(false);
-        let thread = spawn_thread(&coworker, "slack-c1-1-000001".into(), Some(predecessor));
+        let (old_sender, _old_queue) = mpsc::channel(THREAD_QUEUE);
+        let previous = Thread {
+            sender: old_sender,
+            finished: predecessor,
+            admission: Admission {
+                slots: Arc::new(Semaphore::new(THREAD_QUEUE)),
+                last_busy_notice: None,
+            },
+        };
+        let thread = spawn_thread(&coworker, "slack-c1-1-000001".into(), Some(&previous));
         thread
             .sender
             .try_send(QueuedMention {
@@ -788,6 +775,64 @@ mod tests {
         shutdown(&stop_tx, &mut JoinSet::new(), &runtime).await;
         assert_eq!(logs.try_recv().unwrap(), "Slack shutdown timed out");
         assert!(runtime.workers.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_worker_closes_an_empty_queue() {
+        let (coworker, _directory, _stop) = test_coworker().await;
+        let (sender, receiver) = mpsc::channel(THREAD_QUEUE);
+        tokio::time::pause();
+        let task = tokio::spawn(thread_worker(
+            coworker,
+            "slack-c1-1-000001".into(),
+            receiver,
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(IDLE_SECONDS)).await;
+        task.await.unwrap();
+        assert!(sender.is_closed());
+    }
+
+    #[tokio::test]
+    async fn closed_queue_processes_every_accepted_mention() {
+        let (mut coworker, _directory, _stop) = test_coworker().await;
+        let provider = Arc::new(crabber::FakeProvider::scripted(vec![
+            vec![
+                crabber::StreamDelta::TextDelta("ok".into()),
+                crabber::StreamDelta::Completed,
+            ];
+            2
+        ]));
+        let runtime = Arc::get_mut(&mut Arc::get_mut(&mut coworker).unwrap().runtime).unwrap();
+        runtime.resolver = provider.clone();
+        runtime.permits.add_permits(1);
+        let (sender, mut receiver) = mpsc::channel(THREAD_QUEUE);
+        let slots = Arc::new(Semaphore::new(THREAD_QUEUE));
+        for id in ["first", "second"] {
+            let mut mention = test_mention(id);
+            mention.text = id.into();
+            sender
+                .try_send(QueuedMention {
+                    mention,
+                    slot: slots.clone().try_acquire_owned().unwrap(),
+                })
+                .unwrap();
+        }
+        receiver.close();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            thread_worker(coworker, "slack-c1-1-000001".into(), receiver),
+        )
+        .await
+        .unwrap();
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        for (request, expected) in requests.iter().zip(["first", "second"]) {
+            assert!(
+                matches!(&request.messages.last().unwrap().parts[0].content, crabber::core::ContentBlock::Text{text} if text==expected)
+            );
+        }
+        assert_eq!(slots.available_permits(), THREAD_QUEUE);
     }
     #[test]
     fn ask_future_is_send() {
