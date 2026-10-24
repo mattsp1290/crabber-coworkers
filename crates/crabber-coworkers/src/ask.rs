@@ -19,7 +19,8 @@ pub enum Session {
     },
 }
 
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AskError {
     #[error("invalid conversation name")]
     InvalidConversation,

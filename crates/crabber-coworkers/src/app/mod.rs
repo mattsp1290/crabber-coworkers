@@ -21,6 +21,15 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Run the agent worker inside a borb. Do not expose this listener publicly.
+    Worker {
+        #[arg(long)]
+        coworker_id: String,
+        #[arg(long, default_value = "/home/borb/workspace/state")]
+        state_dir: PathBuf,
+        #[arg(long, default_value = "0.0.0.0:8090")]
+        listen: std::net::SocketAddr,
+    },
     /// Answer Slack mentions for every coworker that has a slack block, until a signal arrives.
     Serve {
         #[arg(long)]
@@ -99,12 +108,16 @@ enum AppError {
     Signal,
     #[error("cannot write output")]
     Output,
+    #[error("cannot configure borb execution; check BORB_TOKEN and borb settings")]
+    Borb,
+    #[error("borb execution requires --conversation")]
+    RemoteConversation,
 }
 
 impl AppError {
     fn exit_code(&self) -> i32 {
         match self {
-            Self::Config(_) | Self::MissingApiKey => 2,
+            Self::Config(_) | Self::MissingApiKey | Self::Borb | Self::RemoteConversation => 2,
             Self::Ask(error) => error.exit_code(),
             Self::Output | Self::Store(_) | Self::List | Self::Signal => 1,
         }
@@ -114,6 +127,7 @@ impl AppError {
 pub(crate) enum Provider {
     FromEnv,
     Injected(Arc<dyn Resolver>),
+    Remote(crate::execution::Remote),
 }
 
 impl Provider {
@@ -121,6 +135,7 @@ impl Provider {
         match self {
             Self::FromEnv => bridge::opencode_go_resolver_from_env(),
             Self::Injected(resolver) => Some(resolver),
+            Self::Remote(_) => None,
         }
     }
 }
@@ -136,6 +151,31 @@ async fn execute(
     credentials: CredentialSource,
     slack_base: &str,
 ) -> i32 {
+    if let Command::Worker {
+        coworker_id,
+        state_dir,
+        listen,
+    } = cli.command
+    {
+        let cancel = if let Some(cancel) = cancel {
+            cancel
+        } else {
+            let Ok(cancel) = install_cancel() else {
+                let _ = writeln!(err, "cannot install signal handlers");
+                return 1;
+            };
+            cancel
+        };
+        return if crate::worker::run(coworker_id, state_dir, listen, cancel)
+            .await
+            .is_ok()
+        {
+            0
+        } else {
+            let _ = writeln!(err, "agent worker failed");
+            1
+        };
+    }
     if let Command::Serve { config } = cli.command {
         return match crate::serve::run(
             config,
@@ -174,7 +214,9 @@ async fn respond(
     cancel: Option<Cancel>,
 ) -> Result<String, AppError> {
     match cli.command {
-        Command::Serve { .. } => unreachable!("serve is dispatched before respond"),
+        Command::Serve { .. } | Command::Worker { .. } => {
+            unreachable!("service commands are dispatched before respond")
+        }
         Command::CheckConfig { config } => Ok(listing(&config::load(&config)?)),
         Command::ListConversations {
             config,
@@ -184,7 +226,11 @@ async fn respond(
             let def = config
                 .coworker(&coworker_id)
                 .ok_or(AskError::UnknownCoworker)?;
-            list_conversations(&config.state_dir, &def.id).await
+            if let Some(remote) = remote_for(&config, &provider)? {
+                remote.list(def).await.map_err(AppError::Ask)
+            } else {
+                list_conversations(&config.state_dir, &def.id).await
+            }
         }
         Command::Ask {
             config,
@@ -194,13 +240,19 @@ async fn respond(
         } => {
             let config = config::load(&config)?;
             let def = validate_request(&config, &coworker_id, &prompt, conversation.as_deref())?;
-            let resolver = provider.resolve().ok_or(AppError::MissingApiKey)?;
+            let remote = remote_for(&config, &provider)?;
             let mut cancel = match cancel {
                 Some(cancel) => cancel,
                 None => install_cancel().map_err(|_| AppError::Signal)?,
             };
             let deadline =
                 tokio::time::Instant::now() + Duration::from_secs(config.limits.model_turn_seconds);
+            if let Some(remote) = remote {
+                let name = conversation.ok_or(AppError::RemoteConversation)?;
+                let answer = remote.answer(def, &name, &prompt, deadline, cancel).await?;
+                return Ok(format!("{answer}\n"));
+            }
+            let resolver = provider.resolve().ok_or(AppError::MissingApiKey)?;
             let session = if let Some(name) = conversation {
                 let store = tokio::select! {
                     biased;
@@ -215,6 +267,22 @@ async fn respond(
             let answer = ask(def, &prompt, resolver, selection, deadline, session, cancel).await?;
             Ok(format!("{answer}\n"))
         }
+    }
+}
+
+fn remote_for(
+    config: &config::Config,
+    provider: &Provider,
+) -> Result<Option<crate::execution::Remote>, AppError> {
+    match (&config.borb, provider) {
+        (_, Provider::Remote(remote)) => Ok(Some(remote.clone())),
+        (Some(settings), Provider::FromEnv) => crate::execution::Remote::new(
+            settings,
+            std::env::var("BORB_TOKEN").map_err(|_| AppError::Borb)?,
+        )
+        .map(Some)
+        .map_err(|_| AppError::Borb),
+        _ => Ok(None),
     }
 }
 
@@ -312,6 +380,30 @@ pub async fn serve_with(
         },
         Provider::Injected(resolver),
         selection,
+        Some(cancel),
+        &mut Vec::new(),
+        err,
+        credentials,
+        slack_base,
+    )
+    .await
+}
+
+/// Run Slack with a remote executor and injected Slack credentials and endpoint.
+pub async fn serve_remote_with(
+    config: PathBuf,
+    remote: crate::execution::Remote,
+    credentials: CredentialSource,
+    cancel: Cancel,
+    slack_base: &str,
+    err: &mut (dyn Write + Send),
+) -> i32 {
+    execute(
+        Cli {
+            command: Command::Serve { config },
+        },
+        Provider::Remote(remote),
+        bridge::production_selection(),
         Some(cancel),
         &mut Vec::new(),
         err,

@@ -5,7 +5,7 @@ use constants::{
     MAX_INSTRUCTIONS_BYTES, MAX_NAME_BYTES, MAX_PROMPT_BYTES, MAX_ROLE_BYTES, MAX_SLACK_ID_BYTES,
     MAX_STATE_DIR_BYTES, MAX_TURN_SECONDS,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     fs::File,
@@ -20,9 +20,11 @@ pub struct Config {
     pub coworkers: Vec<CoworkerDefinition>,
     #[serde(default)]
     pub limits: Limits,
+    #[serde(default)]
+    pub borb: Option<BorbConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoworkerDefinition {
     pub id: String,
@@ -33,12 +35,63 @@ pub struct CoworkerDefinition {
     pub slack: Option<SlackConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SlackConfig {
     pub team_id: String,
     pub allowed_channel_ids: Vec<String>,
     pub allowed_user_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BorbConfig {
+    pub url: String,
+    pub name_prefix: String,
+    pub image: String,
+    pub model_secret: String,
+}
+
+impl BorbConfig {
+    fn validate(&self, coworkers: &[CoworkerDefinition]) -> Result<(), ConfigError> {
+        if coworkers
+            .iter()
+            .any(|def| self.name_prefix.len() + 1 + def.id.len() > 40)
+        {
+            return Err(ConfigError(
+                "coworker id and borb.name_prefix must fit within 40 bytes".into(),
+            ));
+        }
+        let url = url::Url::parse(&self.url).map_err(|_| ConfigError("invalid borb.url".into()))?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(ConfigError("invalid borb.url".into()));
+        }
+        if !valid_id(&self.name_prefix) || self.name_prefix.len() > 24 {
+            return Err(ConfigError("invalid borb.name_prefix".into()));
+        }
+        let Some((repository, digest)) = self.image.split_once("@sha256:") else {
+            return Err(ConfigError("borb.image must use a sha256 digest".into()));
+        };
+        if repository.is_empty()
+            || repository.chars().any(char::is_whitespace)
+            || digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(ConfigError("borb.image must use a sha256 digest".into()));
+        }
+        if !valid_id(&self.model_secret) || self.model_secret.len() > 63 {
+            return Err(ConfigError("invalid borb.model_secret".into()));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,7 +126,12 @@ impl Config {
         self.coworkers.iter().filter(|def| def.slack.is_some())
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    /// # Errors
+    /// Returns fixed diagnostics when configuration values are invalid.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(borb) = &self.borb {
+            borb.validate(&self.coworkers)?;
+        }
         let mut errors = Vec::new();
         let state_dir = self.state_dir.to_string_lossy();
         if state_dir.trim().is_empty() || state_dir.len() > MAX_STATE_DIR_BYTES {
@@ -240,6 +298,40 @@ mod tests {
         std::fs::write(file.path(), value.to_string()).unwrap();
         load(file.path())
     }
+    #[test]
+    fn borb_requires_safe_endpoint_and_immutable_image() {
+        let mut value = example();
+        value["borb"] = json!({
+            "url":"http://127.0.0.1:18080", "name_prefix":"coworkers",
+            "image":format!("registry/borb/coworkers@sha256:{}", "a".repeat(64)),
+            "model_secret":"coworkers-model"
+        });
+        assert!(parse(&value).is_ok());
+        for (field, bad) in [
+            ("url", "http://user:secret-marker@host"),
+            ("url", "http://host/?secret-marker"),
+            ("image", "registry/worker:latest"),
+            ("name_prefix", "bad/value"),
+            ("model_secret", "../secret-marker"),
+        ] {
+            let mut invalid = value.clone();
+            invalid["borb"][field] = json!(bad);
+            let error = parse(&invalid).unwrap_err().to_string();
+            assert!(!error.contains("secret-marker"));
+        }
+    }
+
+    #[test]
+    fn borb_name_fits_service_limit() {
+        let mut value = example();
+        value["borb"] = json!({"url":"http://localhost:8080", "name_prefix":"coworkers",
+            "image":format!("registry/worker@sha256:{}", "a".repeat(64)), "model_secret":"model-access"});
+        value["coworkers"][0]["id"] = json!("a".repeat(30));
+        assert!(parse(&value).is_ok());
+        value["coworkers"][0]["id"] = json!("a".repeat(31));
+        assert!(parse(&value).unwrap_err().to_string().contains("40 bytes"));
+    }
+
     #[test]
     fn slack_block_parses() {
         let config = parse(&example()).unwrap();
