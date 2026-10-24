@@ -47,6 +47,8 @@ pub enum ServeError {
     NoSlackCoworkers,
     #[error("OPENCODE_GO_API_KEY is not set")]
     MissingApiKey,
+    #[error("cannot configure borb execution; check BORB_TOKEN and borb settings")]
+    Borb,
     #[error(transparent)]
     Credentials(#[from] slack::CredentialError),
     #[error("cannot install signal handlers")]
@@ -67,6 +69,7 @@ impl ServeError {
             Self::Config(_)
             | Self::NoSlackCoworkers
             | Self::MissingApiKey
+            | Self::Borb
             | Self::Credentials(_) => 2,
             Self::Interrupted => 130,
             Self::Signal | Self::Auth(_) | Self::Store(_) | Self::Connection(_) => 1,
@@ -82,17 +85,67 @@ fn stop_future(mut rx: Stop) -> Cancel {
     })
 }
 
+fn install_renewal() -> Result<Cancel, ServeError> {
+    #[cfg(unix)]
+    {
+        let mut signal =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+                .map_err(|_| ServeError::Signal)?;
+        Ok(Box::pin(async move {
+            signal.recv().await;
+        }))
+    }
+    #[cfg(not(unix))]
+    Ok(Box::pin(std::future::pending()))
+}
+
 // Abort the cancellation listener on every exit, including partial startup failure.
 struct Supervisor(JoinHandle<()>);
+impl Supervisor {
+    fn notify(cancel: Cancel, stops: Vec<watch::Sender<bool>>) -> Self {
+        Self(tokio::spawn(async move {
+            cancel.await;
+            for stop in stops {
+                let _ = stop.send(true);
+            }
+        }))
+    }
+}
 impl Drop for Supervisor {
     fn drop(&mut self) {
         self.0.abort();
     }
 }
 
+enum Backend {
+    Local {
+        resolver: Arc<dyn Resolver>,
+        selection: Selection,
+    },
+    Borb(crate::execution::Remote),
+}
+
+impl Backend {
+    fn new(config: &Config, provider: Provider, selection: Selection) -> Result<Self, ServeError> {
+        Ok(match (&config.borb, provider) {
+            (_, Provider::Remote(remote)) => Self::Borb(remote),
+            (Some(settings), Provider::FromEnv) => Self::Borb(
+                crate::execution::Remote::new(
+                    settings,
+                    std::env::var("BORB_TOKEN").map_err(|_| ServeError::Borb)?,
+                )
+                .map_err(|_| ServeError::Borb)?,
+            ),
+            (_, provider) => Self::Local {
+                resolver: provider.resolve().ok_or(ServeError::MissingApiKey)?,
+                selection,
+            },
+        })
+    }
+}
+
 struct Runtime {
-    resolver: Arc<dyn Resolver>,
-    selection: Selection,
+    backend: Backend,
     permits: Semaphore,
     stop: Stop,
     log: Log,
@@ -117,7 +170,7 @@ struct Coworker {
     index: usize,
     api: Arc<SlackApi>,
     identity: Identity,
-    store: Arc<SqliteStore>,
+    store: Option<Arc<SqliteStore>>,
     runtime: Arc<Runtime>,
 }
 impl Coworker {
@@ -147,7 +200,7 @@ pub(crate) async fn run(
     if config.slack_coworkers().next().is_none() {
         return Err(ServeError::NoSlackCoworkers);
     }
-    let resolver = provider.resolve().ok_or(ServeError::MissingApiKey)?;
+    let backend = Backend::new(&config, provider, selection)?;
     let tokens = config
         .coworkers
         .iter()
@@ -159,12 +212,11 @@ pub(crate) async fn run(
         Some(cancel) => cancel,
         None => install_cancel().map_err(|_| ServeError::Signal)?,
     };
+    let renewal = install_renewal()?;
+    let (admission_tx, admission) = watch::channel(false);
     let (stop_tx, stop) = watch::channel(false);
-    let supervisor_tx = stop_tx.clone();
-    let _supervisor = Supervisor(tokio::spawn(async move {
-        cancel.await;
-        let _ = supervisor_tx.send(true);
-    }));
+    let _supervisor = Supervisor::notify(cancel, vec![stop_tx.clone(), admission_tx.clone()]);
+    let _renewal = Supervisor::notify(renewal, vec![admission_tx.clone()]);
     let mut startup_stop = stop_future(stop.clone());
     let mut authenticated = Vec::new();
     for (index, token) in tokens {
@@ -189,8 +241,7 @@ pub(crate) async fn run(
     }
     let (log, mut logs) = mpsc::unbounded_channel();
     let runtime = Arc::new(Runtime {
-        resolver,
-        selection,
+        backend,
         permits: Semaphore::new(config.limits.max_concurrent_turns),
         stop: stop.clone(),
         log,
@@ -198,10 +249,14 @@ pub(crate) async fn run(
     });
     let mut ready = Vec::new();
     for (index, api, identity, url) in authenticated {
-        let store = tokio::select! {
-            biased;
-            () = &mut startup_stop => return Err(ServeError::Interrupted),
-            result = store::open(&config.state_dir, &config.coworkers[index].id) => result?,
+        let store = if matches!(runtime.backend, Backend::Local { .. }) {
+            Some(tokio::select! {
+                biased;
+                () = &mut startup_stop => return Err(ServeError::Interrupted),
+                result = store::open(&config.state_dir, &config.coworkers[index].id) => result?,
+            })
+        } else {
+            None
         };
         ready.push((
             Arc::new(Coworker {
@@ -219,11 +274,12 @@ pub(crate) async fn run(
     let mut socket_names = HashMap::new();
     for (coworker, url) in ready {
         let name = coworker.id().to_owned();
-        let task = sockets.spawn(coworker_loop(coworker, url));
+        let task = sockets.spawn(coworker_loop(coworker, url, admission.clone()));
         socket_names.insert(task.id(), name);
     }
-    let outcome = supervise(&mut sockets, &socket_names, stop.clone(), &mut logs, err).await;
-    shutdown(&stop_tx, &mut sockets, &runtime).await;
+    let outcome = supervise(&mut sockets, &socket_names, admission, &mut logs, err).await;
+    let _ = admission_tx.send(true);
+    settle_workers(outcome.is_ok(), &stop_tx, &mut sockets, &runtime).await;
     while let Ok(line) = logs.try_recv() {
         let _ = writeln!(err, "{line}");
     }
@@ -231,6 +287,34 @@ pub(crate) async fn run(
         let _ = writeln!(err, "stopped");
     }
     outcome
+}
+
+async fn settle_workers(
+    graceful: bool,
+    stop: &watch::Sender<bool>,
+    sockets: &mut JoinSet<Result<(), ServeError>>,
+    runtime: &Runtime,
+) {
+    if graceful && !*runtime.stop.borrow() {
+        let timed_out = {
+            let finish = finish_workers(sockets, runtime);
+            tokio::pin!(finish);
+            tokio::select! {
+                biased;
+                () = stop_future(runtime.stop.clone()) => tokio::time::timeout(
+                    Duration::from_secs(SHUTDOWN_SECONDS), &mut finish,
+                ).await.is_err(),
+                () = &mut finish => false,
+            }
+        };
+        if timed_out {
+            let _ = runtime.log.send("Slack shutdown timed out".into());
+            sockets.abort_all();
+            while sockets.join_next().await.is_some() {}
+        }
+    } else {
+        shutdown(stop, sockets, runtime).await;
+    }
 }
 
 async fn supervise(
@@ -261,22 +345,12 @@ async fn shutdown(
     runtime: &Runtime,
 ) {
     let _ = stop.send(true);
-    // Sockets own all worker spawns; join them before taking the worker set.
-    let finish = async {
-        while sockets.join_next().await.is_some() {}
-        let mut workers = {
-            let mut set = runtime.workers.lock().expect("worker set poisoned");
-            std::mem::take(&mut *set)
-        };
-        while let Some(result) = workers.join_next().await {
-            if result.is_err() {
-                let _ = runtime.log.send("Slack worker failed".into());
-            }
-        }
-    };
-    if tokio::time::timeout(Duration::from_secs(SHUTDOWN_SECONDS), finish)
-        .await
-        .is_err()
+    if tokio::time::timeout(
+        Duration::from_secs(SHUTDOWN_SECONDS),
+        finish_workers(sockets, runtime),
+    )
+    .await
+    .is_err()
     {
         let _ = runtime.log.send("Slack shutdown timed out".into());
         sockets.abort_all();
@@ -289,7 +363,24 @@ async fn shutdown(
     }
 }
 
-async fn coworker_loop(coworker: Arc<Coworker>, url: url::Url) -> Result<(), ServeError> {
+async fn finish_workers(sockets: &mut JoinSet<Result<(), ServeError>>, runtime: &Runtime) {
+    while sockets.join_next().await.is_some() {}
+    let mut workers = {
+        let mut set = runtime.workers.lock().expect("worker set poisoned");
+        std::mem::take(&mut *set)
+    };
+    while let Some(result) = workers.join_next().await {
+        if result.is_err() {
+            let _ = runtime.log.send("Slack worker failed".into());
+        }
+    }
+}
+
+async fn coworker_loop(
+    coworker: Arc<Coworker>,
+    url: url::Url,
+    admission: Stop,
+) -> Result<(), ServeError> {
     let mut handler = Handler {
         coworker: coworker.clone(),
         recent: HashSet::new(),
@@ -300,7 +391,7 @@ async fn coworker_loop(coworker: Arc<Coworker>, url: url::Url) -> Result<(), Ser
     let socket = socket::run(
         coworker.api.clone(),
         Some(url),
-        stop_future(coworker.runtime.stop.clone()),
+        stop_future(admission),
         log,
         move |event| handler.handle(event),
     );
@@ -501,20 +592,35 @@ async fn process_mention(coworker: &Coworker, name: &str, mention: &Mention) -> 
         result = coworker.runtime.permits.acquire() => result.expect("semaphore stays open"),
     };
     let deadline = Instant::now() + Duration::from_secs(coworker.config.limits.model_turn_seconds);
-    // Never race/drop ask: cancellation must interrupt and settle its admitted run.
-    let answer = ask::ask(
-        &coworker.config.coworkers[coworker.index],
-        &mention.text,
-        coworker.runtime.resolver.clone(),
-        coworker.runtime.selection.clone(),
-        deadline,
-        Session::Durable {
-            store: coworker.store.clone(),
-            name: name.into(),
-        },
-        stop,
-    )
-    .await;
+    let def = &coworker.config.coworkers[coworker.index];
+    let answer = match &coworker.runtime.backend {
+        Backend::Local {
+            resolver,
+            selection,
+        } => {
+            ask::ask(
+                def,
+                &mention.text,
+                resolver.clone(),
+                selection.clone(),
+                deadline,
+                Session::Durable {
+                    store: coworker
+                        .store
+                        .clone()
+                        .expect("local backend owns its store"),
+                    name: name.into(),
+                },
+                stop,
+            )
+            .await
+        }
+        Backend::Borb(remote) => {
+            remote
+                .answer(def, name, &mention.text, deadline, stop)
+                .await
+        }
+    };
     drop(permit);
     match answer {
         Ok(answer) => {
@@ -565,10 +671,12 @@ mod tests {
         let (stop_tx, stop) = watch::channel(false);
         let (log, _) = mpsc::unbounded_channel();
         let runtime = Arc::new(Runtime {
-            resolver: provider.clone(),
-            selection: Selection {
-                provider_id: "fake".into(),
-                model_id: "scripted".into(),
+            backend: Backend::Local {
+                resolver: provider.clone(),
+                selection: Selection {
+                    provider_id: "fake".into(),
+                    model_id: "scripted".into(),
+                },
             },
             permits: Semaphore::new(1),
             stop,
@@ -590,7 +698,7 @@ mod tests {
                 user_id: "UBOT".into(),
                 bot_id: "B1".into(),
             },
-            store: store::open(directory.path(), "scout").await.unwrap(),
+            store: Some(store::open(directory.path(), "scout").await.unwrap()),
             runtime: runtime.clone(),
         });
         // Represent an idle predecessor whose closed queue is still draining.
@@ -641,10 +749,12 @@ mod tests {
         let (stop_tx, stop) = watch::channel(false);
         let (log, _) = mpsc::unbounded_channel();
         let runtime = Arc::new(Runtime {
-            resolver: Arc::new(crabber::FakeProvider::scripted(vec![])),
-            selection: Selection {
-                provider_id: "fake".into(),
-                model_id: "scripted".into(),
+            backend: Backend::Local {
+                resolver: Arc::new(crabber::FakeProvider::scripted(vec![])),
+                selection: Selection {
+                    provider_id: "fake".into(),
+                    model_id: "scripted".into(),
+                },
             },
             permits: Semaphore::new(0),
             stop,
@@ -666,7 +776,7 @@ mod tests {
                 user_id: "UBOT".into(),
                 bot_id: "B1".into(),
             },
-            store: store::open(directory.path(), "scout").await.unwrap(),
+            store: Some(store::open(directory.path(), "scout").await.unwrap()),
             runtime,
         });
         (coworker, directory, stop_tx)
@@ -761,10 +871,12 @@ mod tests {
         let (stop_tx, stop) = watch::channel(false);
         let (log, mut logs) = mpsc::unbounded_channel();
         let runtime = Runtime {
-            resolver: Arc::new(crabber::FakeProvider::scripted(vec![])),
-            selection: Selection {
-                provider_id: "fake".into(),
-                model_id: "scripted".into(),
+            backend: Backend::Local {
+                resolver: Arc::new(crabber::FakeProvider::scripted(vec![])),
+                selection: Selection {
+                    provider_id: "fake".into(),
+                    model_id: "scripted".into(),
+                },
             },
             permits: Semaphore::new(1),
             stop,
@@ -804,7 +916,9 @@ mod tests {
             2
         ]));
         let runtime = Arc::get_mut(&mut Arc::get_mut(&mut coworker).unwrap().runtime).unwrap();
-        runtime.resolver = provider.clone();
+        if let Backend::Local { resolver, .. } = &mut runtime.backend {
+            *resolver = provider.clone();
+        }
         runtime.permits.add_permits(1);
         let (sender, mut receiver) = mpsc::channel(THREAD_QUEUE);
         let slots = Arc::new(Semaphore::new(THREAD_QUEUE));

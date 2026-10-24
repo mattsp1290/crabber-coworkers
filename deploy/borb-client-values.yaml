@@ -1,0 +1,5 @@
+clients:
+  - name: coworkers
+    namespace: borb-system
+    serviceAccount: crabber-coworkers
+    admin: false

@@ -14,6 +14,8 @@ cargo xtask check
 
 Set `OPENCODE_GO_API_KEY` in your environment before using `ask`. The provider is OpenCode Go and the model is `deepseek-v4-flash`.
 
+For Kubernetes agent execution, see [running coworkers in borb](docs/borb.md). Slack mentions and replies use the same bot and threads.
+
 See [setup](docs/setup.md) for configuration and [manual smoke testing](docs/manual-smoke.md) for an optional live check.
 
 Not yet: tools and per-coworker workspaces.
