@@ -48,9 +48,13 @@ Record only outcomes and event key names. Never record token values, real team/c
 
 | Date | Commit SHA | Crabber rev | Coworker | Step | Observed result / event key names |
 | --- | --- | --- | --- | --- | --- |
+| 2026-10-24 | `416526d9655a515568a55965475bfcf9fb97de60` | `a32b1a83bce10649b56498d7967ab3383490aa51` | scout | 1 | Human root mention received a threaded model reply; user confirmed marker retention. |
+| 2026-10-24 | `416526d9655a515568a55965475bfcf9fb97de60` | `a32b1a83bce10649b56498d7967ab3383490aa51` | scout | 2 | User confirmed recall within the same thread. Before restart that thread contained 3 user/assistant exchanges. Observed threaded event key names are recorded in the probe below. |
+| 2026-10-24 | `416526d9655a515568a55965475bfcf9fb97de60` | `a32b1a83bce10649b56498d7967ab3383490aa51` | scout | 3 | SIGINT produced the fixed stderr line `stopped`; OS process-exit notification confirmed exit 0. |
+| 2026-10-24 | `416526d9655a515568a55965475bfcf9fb97de60` | `a32b1a83bce10649b56498d7967ab3383490aa51` | scout | 4 | After restart on the same state, the user confirmed marker recall without repeating values. The same thread advanced from 3 to 4 user/assistant exchanges. |
 
 A live TLS/Socket Mode probe on 2026-10-23 at `0078fa2ced880c240ac9ea50363f000bf3d46a8c` observed these keys on an API-authored threaded `app_mention`: `app_id, blocks, bot_id, bot_profile, channel, event_ts, parent_user_id, team, text, thread_ts, ts, type, user`. The fake includes this shape and proves it is acknowledged and ignored, even when the user is allowlisted.
 
-Required human-authored steps 1–4 remain pending; the API probe is not a successful G4 record.
+Required human-authored steps 1–4 passed in the record above, completing gate G4. The API probe separately establishes the transport/event shape and the bot-event rejection boundary; it is not used as evidence of human-authored recall.
 
 Check the manifest template independently: its `bot_events` list must contain only `app_mention`, with no `message.*` event.
