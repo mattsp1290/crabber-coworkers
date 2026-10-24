@@ -13,10 +13,20 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - run: git config --global "url.https://github.com/mattsp1290/crabber.git.insteadOf" "ssh://git@github.com/mattsp1290/crabber.git"
-      - run: git config --global "url.https://github.com/mattsp1290/borb.git.insteadOf" "ssh://git@github.com/mattsp1290/borb.git"
+      - name: Authenticate the private borb dependency
+        env:
+          BORB_DEPLOY_KEY: ${{ secrets.BORB_DEPLOY_KEY }}
+        run: |
+          eval "$(ssh-agent -s)"
+          ssh-add - <<< "$BORB_DEPLOY_KEY" > /dev/null 2>&1
+          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+          mkdir -p ~/.ssh
+          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >> ~/.ssh/known_hosts
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
         with:
           toolchain: 1.99.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
       - run: cargo xtask check
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
