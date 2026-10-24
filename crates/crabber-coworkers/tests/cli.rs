@@ -263,3 +263,95 @@ async fn listing_wal_snapshot_does_not_change_database_bytes() {
     assert!(unchanged, "listing changed database bytes");
     drop(db);
 }
+
+#[test]
+fn serve_requires_slack_coworker() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = common::write_state_config(temp.path(), 1);
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    v["coworkers"][0].as_object_mut().unwrap().remove("slack");
+    std::fs::write(&path, v.to_string()).unwrap();
+    let output = binary()
+        .args(["serve", "--config"])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.stderr, b"no coworker has a slack block\n");
+    assert_eq!(output.stdout, b"");
+    assert!(!temp.path().join("state").exists());
+}
+
+#[test]
+fn serve_requires_tokens_before_network() {
+    for (bot, app, message) in [
+        (None, None, "SLACK_BOT_TOKEN_SCOUT is not set"),
+        (
+            Some("xoxp-test"),
+            None,
+            "SLACK_BOT_TOKEN_SCOUT has the wrong token type",
+        ),
+        (Some("xoxb-test"), None, "SLACK_APP_TOKEN_SCOUT is not set"),
+        (
+            Some("xoxb-test"),
+            Some("xoxe.xapp-test"),
+            "SLACK_APP_TOKEN_SCOUT has the wrong token type",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = common::write_state_config(temp.path(), 1);
+        let mut command = binary();
+        command
+            .args(["serve", "--config"])
+            .arg(path)
+            .env("OPENCODE_GO_API_KEY", "test-key")
+            .env_remove("SLACK_BOT_TOKEN_SCOUT")
+            .env_remove("SLACK_APP_TOKEN_SCOUT");
+        if let Some(bot) = bot {
+            command.env("SLACK_BOT_TOKEN_SCOUT", bot);
+        }
+        if let Some(app) = app {
+            command.env("SLACK_APP_TOKEN_SCOUT", app);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.stderr, format!("{message}\n").as_bytes());
+        assert_eq!(output.stdout, b"");
+        assert!(!temp.path().join("state").exists());
+    }
+}
+
+#[test]
+fn serve_requires_api_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = common::write_state_config(temp.path(), 1);
+    let output = binary()
+        .args(["serve", "--config"])
+        .arg(path)
+        .env_remove("OPENCODE_GO_API_KEY")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.stderr, b"OPENCODE_GO_API_KEY is not set\n");
+    assert_eq!(output.stdout, b"");
+    assert!(!temp.path().join("state").exists());
+}
+
+#[test]
+fn serve_validates_config_before_credentials() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), "{}").unwrap();
+    let output = binary()
+        .args(["serve", "--config"])
+        .arg(file.path())
+        .env_remove("OPENCODE_GO_API_KEY")
+        .env_remove("SLACK_BOT_TOKEN_SCOUT")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        output.stderr,
+        b"invalid configuration JSON at line 1, column 2 (data)\n"
+    );
+    assert_eq!(output.stdout, b"");
+}

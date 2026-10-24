@@ -5,7 +5,16 @@
       "id": "scout",
       "name": "Scout",
       "role": "Researcher",
-      "instructions": "Investigate the question and distinguish evidence from assumptions. Explain what you found and identify any uncertainty."
+      "instructions": "Investigate the question and distinguish evidence from assumptions. Explain what you found and identify any uncertainty.",
+      "slack": {
+        "team_id": "T0000000001",
+        "allowed_channel_ids": [
+          "C0000000001"
+        ],
+        "allowed_user_ids": [
+          "U0000000001"
+        ]
+      }
     },
     {
       "id": "quill",

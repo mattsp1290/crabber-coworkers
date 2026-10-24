@@ -17,11 +17,15 @@ thiserror = "2"
 url = "2"
 time = { version = "0.3", features = ["formatting"] }
 
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
 [dev-dependencies]
 async-trait = "0.1"
 tempfile = "3"
 futures = "0.3"
-tokio = { version = "1", features = ["net", "io-util"] }
+tokio = { version = "1", features = ["net", "io-util", "test-util"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -79,3 +79,56 @@ pub fn write_state_config(
     std::fs::write(&path, config.to_string()).unwrap();
     path
 }
+
+pub mod slack;
+
+#[derive(Clone)]
+pub struct Gated {
+    requests: Arc<std::sync::Mutex<Vec<ModelRequest>>>,
+    releases: Arc<tokio::sync::Semaphore>,
+}
+impl Gated {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            requests: Arc::default(),
+            releases: Arc::new(tokio::sync::Semaphore::new(0)),
+        })
+    }
+    pub fn requests(&self) -> Vec<ModelRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+    pub fn release(&self) {
+        self.releases.add_permits(1);
+    }
+}
+#[async_trait]
+impl Resolver for Gated {
+    fn binding_descriptor(
+        &self,
+        selection: &Selection,
+    ) -> Result<crabber::core::ProviderBindingDescriptor, crabber::providers::ProviderBindingError>
+    {
+        Pending.binding_descriptor(selection)
+    }
+    async fn resolve(&self, _: &Selection) -> Result<Arc<dyn Streamer>, ProviderError> {
+        Ok(Arc::new(self.clone()))
+    }
+}
+#[async_trait]
+impl Streamer for Gated {
+    async fn stream(&self, request: ModelRequest) -> Result<DeltaStream, ProviderError> {
+        use futures::StreamExt;
+        self.requests.lock().unwrap().push(request);
+        let releases = self.releases.clone();
+        Ok(Box::pin(
+            futures::stream::once(async move {
+                let permit = releases.acquire().await.unwrap();
+                permit.forget();
+                StreamDelta::TextDelta("ok".into())
+            })
+            .chain(futures::stream::once(std::future::ready(
+                StreamDelta::Completed,
+            ))),
+        ))
+    }
+}

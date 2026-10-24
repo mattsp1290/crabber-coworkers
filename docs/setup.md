@@ -28,11 +28,16 @@ cargo xtask check
 | `coworkers[].name` | Required | Nonblank after trimming; at most 100 bytes; no control characters |
 | `coworkers[].role` | Required | Nonblank after trimming; at most 200 bytes; no control characters |
 | `coworkers[].instructions` | Required | Nonblank after trimming; at most 16,384 bytes |
+| `coworkers[].slack` | Optional | Object containing only the following three Slack fields |
+| `coworkers[].slack.team_id` | Required with Slack | `T` followed by 1–31 uppercase ASCII letters or digits |
+| `coworkers[].slack.allowed_channel_ids` | Required with Slack | 1–64 unique IDs; `C` or `G` followed by 1–31 uppercase ASCII letters or digits |
+| `coworkers[].slack.allowed_user_ids` | Required with Slack | 1–256 unique IDs; `U` or `W` followed by 1–31 uppercase ASCII letters or digits |
+| `limits.max_concurrent_turns` | 4 | 1–32 model turns across all Slack coworkers |
 | `limits` | Optional; defaults below | Object containing only the following fields |
 | `limits.max_prompt_bytes` | 32,768 | 1–1,048,576 bytes |
 | `limits.model_turn_seconds` | 120 | 1–3,600 seconds |
 
-Provider and model are fixed to `opencode-go` and `deepseek-v4-flash`; neither is configurable in JSON. Credentials come only from `OPENCODE_GO_API_KEY`. See the [live smoke procedure](manual-smoke.md) to set it and run:
+Provider and model are fixed to `opencode-go` and `deepseek-v4-flash`; neither is configurable in JSON. The model credential comes only from `OPENCODE_GO_API_KEY`. See the [live smoke procedure](manual-smoke.md) to set it and run:
 
 ```sh
 target/release/crabber-coworkers ask --config config.example.json scout "<prompt>"
@@ -80,7 +85,7 @@ The tool never logs credential values, prompt text, answer text, or raw provider
 
 Tests need no credentials or database server. They use temporary SQLite files. If a local proxy is set, set `NO_PROXY=127.0.0.1,localhost` for direct test runs; `cargo xtask check` sets it on its test subprocess. The gate checks formatting, Clippy, workspace tests, the release build, the resolved crabber pin, and the example config, in that order. All dependency resolution is locked.
 
-`limits.model_turn_seconds` starts before the store is opened and covers store open, session creation, admission, every provider retry, and reading the answer. Admission itself is not cancellable; if it finishes after the deadline the run is interrupted at once. On timeout, SIGINT, SIGTERM, or SIGHUP the run is interrupted and the process waits up to 5 seconds for it to settle, so the conversation stays usable. Signal exits use code 130 with `interrupted`. Only `ask` installs signal handlers; `check-config` and `list-conversations` keep the default behavior. If the answer completed in the same instant a signal arrived, the answer is printed and the exit code is 0.
+For `ask`, `limits.model_turn_seconds` starts before the store is opened and covers store open, session creation, admission, every provider retry, and reading the answer. Admission itself is not cancellable; if it finishes after the deadline the run is interrupted at once. On timeout, SIGINT, SIGTERM, or SIGHUP the run is interrupted and the process waits up to 5 seconds for it to settle, so the conversation stays usable. Signal exits use code 130 with `interrupted`. `serve` and `ask` install signal handlers; `check-config` and `list-conversations` keep the default behavior. If the answer completed in the same instant a signal arrived, the answer is printed and the exit code is 0.
 
 ## Conversations
 
@@ -100,3 +105,53 @@ There is no per-conversation delete yet: crabber's session-owner cleanup protoco
 A hard crash (SIGKILL, power loss, or a panic) during a turn leaves that conversation reporting `conversation is busy`. Use a new conversation name or remove the coworker's file. Automatic recovery waits on a crabber reconciliation API. A crabber pin bump that changes the SQLite schema version makes existing files unusable (`cannot open conversation store`); archive or remove them before upgrading.
 
 Prompts are currently a command-line argument. Operating-system argument limits can be smaller than `max_prompt_bytes`; for example, Linux commonly limits one argument to about 128 KiB. Such an oversized argument is rejected by the OS before the CLI runs.
+
+
+## Serving Slack
+
+Follow [Slack setup](slack-setup.md) to create one app per coworker. Slack credentials come only from environment variables:
+
+| Variable | Token type |
+| --- | --- |
+| `SLACK_BOT_TOKEN_<ID>` | `xoxb-` bot token |
+| `SLACK_APP_TOKEN_<ID>` | `xapp-` app-level token |
+
+`<ID>` is the coworker ID uppercased with hyphens replaced by underscores: `code-review-2` becomes `CODE_REVIEW_2`. Rotating `xoxe.xapp-` tokens are rejected.
+
+`serve --config config.json` validates configuration, checks the model key and every Slack token variable, installs signal handlers, checks every bot identity with `auth.test` and opens its Socket Mode URL with `apps.connections.open`, opens stores, then connects sockets. Missing inputs exit 2 before network or disk creation; rejected Slack tokens exit 1 before store creation. A stop during startup exits 130 with `interrupted`.
+
+Only allowlisted `app_mention` events are answered. Unmentioned thread messages, other teams, users or channels, bot-authored events, and subtypes are acknowledged and ignored silently. A thread uses `slack-<channel lowercased>-<root timestamp with dots replaced by hyphens>`, for example `slack-c0000000001-1515449522-000016`. An explicit `thread_ts` continues the root's history; a root mention starts a new conversation.
+
+Each thread has a queue of 4 waiting mentions plus its active turn. Overflow gets the busy notice below at most once per thread per 30 seconds. Turns in a thread run in arrival order. `limits.max_concurrent_turns` caps model turns globally; the permit is released before delivery or a rate-limit wait. The model-turn deadline starts after the permit is acquired.
+
+Answers are escaped and split into at most 8 chunks of 3,500 Unicode scalar values, keeping escaped entities whole and preferring newlines. If more is needed, the last chunk ends with `[answer truncated]`. Slack rate limits retry a chunk once, after a wait capped at 30 seconds. Other delivery failures produce only a fixed log message.
+
+SIGINT, SIGTERM, or SIGHUP stops intake, drops queued mentions, interrupts active turns, and waits up to 20 seconds for shutdown. A normal stop exits 0 with `stopped`. A fatal socket failure uses the same shutdown routine and exits 1. Answers go only to Slack; `serve` writes no stdout.
+
+| Fixed message | Exit code / destination |
+| --- | --- |
+| `coworkers[i].slack.team_id must be a Slack team ID` | 2 |
+| `coworkers[i].slack.allowed_channel_ids must contain 1–64 unique Slack channel IDs` | 2 |
+| `coworkers[i].slack.allowed_user_ids must contain 1–256 unique Slack user IDs` | 2 |
+| `limits.max_concurrent_turns must be in 1..=32` | 2 |
+| `no coworker has a slack block` | 2 |
+| `<VAR> is not set` | 2 |
+| `<VAR> has the wrong token type` | 2 |
+| `Slack authentication failed for <id>` | 1 |
+| `Slack connection stopped for <id>` | 1 |
+| `interrupted` | 130 during startup |
+| `stopped` | 0 after serving |
+| `Slack connected for <id>` | stderr log |
+| `Slack reconnecting for <id>` | stderr log |
+| `Slack delivery failed for <id>` | stderr log |
+| `Slack event ignored for <id>` | stderr log |
+| `Slack worker failed` | stderr log; worker task ended unexpectedly |
+| `Slack shutdown timed out` | stderr log; remaining tasks aborted |
+
+The transport's library errors are fixed categories: `Slack authentication failed`, `Slack rate limited`, `Slack request failed`, `Slack rejected the request`, and `Slack disabled the Socket Mode link`. The daemon maps them to the coworker-specific messages above. Slack notices are listed in [Slack setup](slack-setup.md).
+
+Acknowledged mentions awaiting an answer are lost if `serve` crashes. Deduplication holds only the last 1,024 accepted event IDs in memory per coworker; redelivery after a restart can be answered twice. A chunk with an unknown delivery outcome is never retried, so a reply can have a missing tail. SIGKILL during a model turn can leave the thread's conversation busy with no automatic recovery; a new root mention starts a usable conversation.
+
+An operator-named conversation starting with `slack-` can collide with a generated name. Using a thread's conversation simultaneously through `serve` and `ask --conversation` reports busy to whichever comes second. When two coworkers are mentioned under one root message, both answer there and keep separate histories in their respective coworker stores.
+
+Stopping cancels delivery, including a rate-limit wait, without logging a delivery failure. An answer already committed to history may therefore be undelivered or only partly delivered when the process stops. A shutdown that exceeds the 20-second budget aborts remaining tasks and can leave a conversation busy, like a hard crash.
