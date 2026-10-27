@@ -18,8 +18,16 @@ For Kubernetes agent execution, see [running coworkers in borb](docs/borb.md). S
 
 See [setup](docs/setup.md) for configuration and [manual smoke testing](docs/manual-smoke.md) for an optional live check.
 
-Not yet: tools and per-coworker workspaces.
+Coworkers can create, list, read, and revise text files in a persistent workspace. Set `workspace` to `read_write` for those four file tools, `read_only` for read/list, or `disabled` for no tools. Omitted grants default to `disabled`. The example enables Scout and disables Quill.
 
-Without `--conversation`, each `ask` uses a fresh in-memory session and writes nothing to disk. Named conversations persist under `state_dir` as one SQLite file per coworker.
+```sh
+target/release/crabber-coworkers ask --config config.example.json scout "Create brief.md with a three-item project checklist. Report the saved relative path."
+target/release/crabber-coworkers ask --config config.example.json scout "Read brief.md and show its contents."
+target/release/crabber-coworkers ask --config config.example.json scout "Read brief.md, then add an item to review the draft."
+```
+
+All authorized users and conversations of a coworker share its files. Local files live in `<state_dir>/workspaces/<coworker-id>/`; borb workers keep them on their own persistent disk. The tools cannot run shell commands, fetch URLs, or publish files. Retrieve files through ordinary read/list requests and the resulting CLI answer or Slack reply. See [workspace access and limits](docs/setup.md#workspace-access-and-limits).
+
+Without `--conversation`, each local `ask` uses fresh in-memory chat history. Workspace files still persist when enabled. With workspace access disabled, an unnamed local `ask` writes nothing to disk. Named conversations persist under `state_dir` as one SQLite file per coworker.
 
 A coworker with a `slack` block answers @mentions from allowlisted users in allowlisted channels, in the thread under the mention. Every turn needs a mention. Thread history is a named conversation under `state_dir` and survives restart. See [Slack setup](docs/slack-setup.md).

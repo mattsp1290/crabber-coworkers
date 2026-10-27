@@ -1,4 +1,3 @@
-//! Host-owned grants and private workspace admission.
 use crate::{
     ask::{AskError, Cancel},
     config::{CoworkerDefinition, WorkspaceAccess, valid_id},

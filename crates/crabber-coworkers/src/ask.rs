@@ -135,7 +135,6 @@ pub async fn ask(
             () = tokio::time::sleep_until(deadline) => return Err(AskError::Timeout),
             () = std::future::ready(()) => {},
         }
-        // Admission must finish: dropping it can strand a preparation reservation.
         let run = agent
             .prompt(session_id, prompt)
             .await

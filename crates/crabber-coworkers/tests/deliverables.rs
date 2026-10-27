@@ -14,6 +14,7 @@ use std::{path::Path, sync::Arc, time::Duration};
 fn definition(access: WorkspaceAccess) -> CoworkerDefinition {
     let mut def = example::config().coworker("scout").unwrap().clone();
     def.workspace = access;
+    def.slack = None;
     def
 }
 
@@ -155,7 +156,7 @@ async fn current_grants_advertise_exact_tools_and_refuse_unsolicited_calls() {
                 "file_edit" => {
                     &json!({"path":"draft.txt","anchor":"retained","replacement":"forbidden"})
                 }
-                "shell" => &json!({"command":"touch forbidden"}),
+                "shell" => &json!({"command":format!("touch {}/forbidden", disk.path().display())}),
                 "url_fetch" => &json!({"url":"http://127.0.0.1:9"}),
                 _ => &json!({"path":"draft.txt"}),
             };
@@ -171,6 +172,8 @@ async fn current_grants_advertise_exact_tools_and_refuse_unsolicited_calls() {
                 },
             )
             .await;
+            assert!(!disk.path().join("forbidden").exists());
+            assert!(!disk.path().join("workspaces/scout/forbidden").exists());
             let requests = provider.requests();
             let mut names: Vec<_> = requests[0]
                 .tools
@@ -244,3 +247,14 @@ async fn session_directory_and_owner_mismatches_fail_before_provider_access() {
     );
     assert_eq!(provider.requests().len(), 0);
 }
+
+#[path = "deliverables/bounds.rs"]
+mod bounds;
+#[path = "deliverables/isolation.rs"]
+mod isolation;
+#[path = "deliverables/local.rs"]
+mod local;
+#[path = "deliverables/process.rs"]
+mod process;
+#[path = "common/worker_process.rs"]
+mod worker_process;

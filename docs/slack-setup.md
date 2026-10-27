@@ -55,6 +55,12 @@ target/release/crabber-coworkers serve --config config.json
 
 Mention the coworker as an allowlisted user in an allowlisted channel. It answers in the thread beneath that root message. Mention it again inside the thread for each follow-up; plain thread messages get no answer. Stop and restart the process and the next mentioned follow-up retains the conversation history. See [the live check](manual-smoke.md#slack-live-check) for qualification.
 
+With `workspace: "read_write"`, ordinary mentions can create and revise files. For example, mention Scout with "Create brief.md with a project checklist and report the saved path." In another authorized thread, mention Scout with "Read brief.md, then add a review step." Ask "List your workspace files" or "Read brief.md" to retrieve the result through a normal reply.
+
+The existing allowlists govern access to the whole coworker workspace. Authorized users in different threads or channels share those files, while their chat histories stay separate. `read_only` permits read/list requests and `disabled` exposes no file tools. There are no attachments or download links. File responses use the same Slack truncation limits as other answers. Ask for bounded line windows when a file is too large for one reply. See [workspace limits](setup.md#workspace-access-and-limits).
+
+Drain active work and restart after changing grants. After enabling or disabling access, use a new root mention because an old thread's stored directory may no longer match. A mismatch produces the generic failure notice below. Completed file changes can survive a failed or missing reply. Read/list the files before retrying a turn.
+
 The service silently ignores other teams, channels, users, bot-authored events, and event subtypes. It strips its own mention tokens from input and decodes Slack's text entities once. Thread names are `slack-<lowercase channel>-<root ts with dots replaced by hyphens>` and appear in `list-conversations`.
 
 Model text escapes `&`, `<`, and `>` and disables parsing, link names, and unfurls so answers cannot ping people. Answers use at most 8 entity-safe chunks of 3,500 characters, ending with `[answer truncated]` if necessary. The fixed notices are:
