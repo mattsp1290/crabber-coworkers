@@ -58,3 +58,48 @@ A live TLS/Socket Mode probe on 2026-10-23 at `0078fa2ced880c240ac9ea50363f000bf
 Required human-authored steps 1–4 passed in the record above, completing gate G4. The API probe separately establishes the transport/event shape and the bot-event rejection boundary; it is not used as evidence of human-authored recall.
 
 Check the manifest template independently: its `bot_events` list must contain only `app_mention`, with no `message.*` event.
+
+## Optional workspace live check
+
+This check uses the real model and Slack. Run it only with separate authorization
+for those calls and any worker restart. Use disposable synthetic file contents.
+The credential-free tests remain the required automated evidence. This procedure
+does not authorize publishing an image or deploying to a cluster.
+
+1. Configure Scout with `workspace: "read_write"` and a second coworker with
+   `workspace: "disabled"`. For remote execution, use matching protocol-2 host
+   and worker binaries with the approved immutable image digest.
+2. From an allowlisted Slack account and channel, start a new root mention asking
+   Scout to create a small UTF-8 file named `smoke/brief.md`. Ask it to create the
+   parent directory and report the saved relative path. Confirm a threaded reply
+   and verify that the file exists on the worker disk.
+3. Drain active turns. Gracefully stop and restart the worker on the same disk.
+   Start a new root mention asking Scout to list `smoke`, read `smoke/brief.md`,
+   and revise one unique phrase. Inspect the worker file to confirm the revision.
+   Confirm that remote execution created no workspace on the host.
+4. Ask the disabled coworker to create a file. Confirm it has no file tools and
+   creates no workspace. Drain work, enable that coworker, and restart the host
+   and its worker. Start a new thread and ask it to access Scout's file through a parent path or absolute path. Confirm
+   failure and verify that Scout's file remains unchanged.
+5. Drain active work and change Scout to `read_only`, then restart the host and
+   affected worker. In the existing workspace conversation, confirm a read works
+   and a requested write or edit leaves the file unchanged.
+6. To check local persistence, use a disposable local configuration with Scout
+   set to `read_write`. Run two `ask` commands without `--conversation`, first
+   to create a file and then to read it. Confirm that the file persists even
+   though neither invocation saves chat history.
+7. Restore the intended grants through another drain and restart. Keep any
+   synthetic files until you decide to remove them manually. The model has no
+   delete tool.
+
+A model's claim that it saved or denied a file is not enough. Inspect the actual
+file state without recording its contents. Do not infer rollback from a timeout,
+interruption, failed cleanup, or missing Slack reply. A started write can finish
+later. Read/list the files before retrying.
+
+Record only outcome flags and code/dependency/image identities. Never record
+message text, answer text, file contents, credentials, real Slack IDs, or raw
+provider errors.
+
+| Date | Commit SHA | Crabber rev | Worker image digest | Step | Outcome flags |
+| --- | --- | --- | --- | --- | --- |

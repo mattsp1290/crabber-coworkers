@@ -21,6 +21,8 @@ async fn happy_path() {
     let selection = common::selection();
     let answer = ask(
         config.coworker("scout").unwrap(),
+        &crabber_coworkers::workspace::Workspace::disabled(config.coworker("scout").unwrap())
+            .unwrap(),
         "Find something",
         provider.clone(),
         selection,
@@ -53,6 +55,8 @@ async fn retry_returns_only_committed_text() {
     ]));
     let result = ask(
         config.coworker("scout").unwrap(),
+        &crabber_coworkers::workspace::Workspace::disabled(config.coworker("scout").unwrap())
+            .unwrap(),
         "hi",
         provider.clone(),
         common::selection(),
@@ -74,6 +78,8 @@ async fn coworker_isolation() {
     ]]));
     ask(
         config.coworker("quill").unwrap(),
+        &crabber_coworkers::workspace::Workspace::disabled(config.coworker("quill").unwrap())
+            .unwrap(),
         "hi",
         provider.clone(),
         common::selection(),
@@ -121,6 +127,8 @@ async fn provider_failure_is_redacted() {
     let config = example::config();
     let error = ask(
         config.coworker("scout").unwrap(),
+        &crabber_coworkers::workspace::Workspace::disabled(config.coworker("scout").unwrap())
+            .unwrap(),
         "hi",
         Arc::new(FakeProvider::scripted(vec![vec![common::failure(false)]])),
         common::selection(),
@@ -139,6 +147,8 @@ async fn timeout_is_bounded() {
     let start = std::time::Instant::now();
     let error = ask(
         config.coworker("scout").unwrap(),
+        &crabber_coworkers::workspace::Workspace::disabled(config.coworker("scout").unwrap())
+            .unwrap(),
         "hi",
         Arc::new(common::Pending),
         common::selection(),
@@ -156,6 +166,8 @@ async fn no_answer() {
     let config = example::config();
     let error = ask(
         config.coworker("scout").unwrap(),
+        &crabber_coworkers::workspace::Workspace::disabled(config.coworker("scout").unwrap())
+            .unwrap(),
         "hi",
         Arc::new(FakeProvider::scripted(vec![vec![
             StreamDelta::ReasoningDelta("internal".into()),
@@ -176,6 +188,8 @@ async fn empty_response_is_a_redacted_runtime_failure() {
     let config = example::config();
     let error = ask(
         config.coworker("scout").unwrap(),
+        &crabber_coworkers::workspace::Workspace::disabled(config.coworker("scout").unwrap())
+            .unwrap(),
         "hi",
         Arc::new(FakeProvider::scripted(vec![vec![StreamDelta::Completed]])),
         common::selection(),
@@ -213,6 +227,7 @@ async fn conversation_continues_across_store_instances() {
     assert_eq!(
         ask(
             def,
+            &crabber_coworkers::workspace::Workspace::disabled(def).unwrap(),
             "first question",
             scripted("first answer"),
             common::selection(),
@@ -230,6 +245,7 @@ async fn conversation_continues_across_store_instances() {
     assert_eq!(
         ask(
             def,
+            &crabber_coworkers::workspace::Workspace::disabled(def).unwrap(),
             "second question",
             provider.clone(),
             common::selection(),
@@ -297,6 +313,7 @@ async fn timeout_interrupts_run_so_next_ask_continues() {
     assert_eq!(
         ask(
             def,
+            &crabber_coworkers::workspace::Workspace::disabled(def).unwrap(),
             "hi",
             Arc::new(common::Pending),
             common::selection(),
@@ -325,6 +342,7 @@ async fn timeout_interrupts_run_so_next_ask_continues() {
     assert_eq!(
         ask(
             def,
+            &crabber_coworkers::workspace::Workspace::disabled(def).unwrap(),
             "again",
             scripted("ok"),
             common::selection(),
@@ -352,6 +370,8 @@ async fn cancel_interrupts_run() {
     assert_eq!(
         ask(
             config.coworker("scout").unwrap(),
+            &crabber_coworkers::workspace::Workspace::disabled(config.coworker("scout").unwrap())
+                .unwrap(),
             "hi",
             Arc::new(common::Pending),
             common::selection(),
@@ -370,6 +390,8 @@ async fn cancel_interrupts_run() {
     assert_eq!(
         ask(
             config.coworker("scout").unwrap(),
+            &crabber_coworkers::workspace::Workspace::disabled(config.coworker("scout").unwrap())
+                .unwrap(),
             "again",
             scripted("ok"),
             common::selection(),
@@ -394,6 +416,8 @@ async fn cancel_already_fired_interrupts_immediately() {
     assert_eq!(
         ask(
             config.coworker("scout").unwrap(),
+            &crabber_coworkers::workspace::Workspace::disabled(config.coworker("scout").unwrap())
+                .unwrap(),
             "hi",
             Arc::new(common::Pending),
             common::selection(),
@@ -413,6 +437,8 @@ async fn cancel_already_fired_interrupts_immediately() {
     assert_eq!(
         ask(
             config.coworker("scout").unwrap(),
+            &crabber_coworkers::workspace::Workspace::disabled(config.coworker("scout").unwrap())
+                .unwrap(),
             "hi",
             Arc::new(common::Pending),
             common::selection(),
@@ -440,6 +466,8 @@ async fn completed_answer_wins_over_pending_signal() {
     assert_eq!(
         ask(
             config.coworker("scout").unwrap(),
+            &crabber_coworkers::workspace::Workspace::disabled(config.coworker("scout").unwrap())
+                .unwrap(),
             "hi",
             scripted("ok"),
             common::selection(),
@@ -464,6 +492,8 @@ async fn conversations_are_isolated_per_coworker() {
         let provider = scripted(id);
         ask(
             config.coworker(id).unwrap(),
+            &crabber_coworkers::workspace::Workspace::disabled(config.coworker(id).unwrap())
+                .unwrap(),
             "hi",
             provider.clone(),
             common::selection(),
@@ -487,6 +517,7 @@ async fn busy_conversation_is_reported() {
     // Initialize the named session, then hold a second turn open.
     ask(
         def,
+        &crabber_coworkers::workspace::Workspace::disabled(def).unwrap(),
         "setup",
         scripted("ok"),
         common::selection(),
@@ -501,6 +532,7 @@ async fn busy_conversation_is_reported() {
         .unwrap();
     let agent = crabber_coworkers::bridge::build_agent(
         def,
+        &crabber_coworkers::workspace::Workspace::disabled(def).unwrap(),
         store,
         Arc::new(common::Pending),
         common::selection(),
@@ -513,6 +545,7 @@ async fn busy_conversation_is_reported() {
     assert_eq!(
         ask(
             def,
+            &crabber_coworkers::workspace::Workspace::disabled(def).unwrap(),
             "busy",
             scripted("bad"),
             common::selection(),
@@ -538,6 +571,7 @@ async fn behavior_version_change_keeps_conversation() {
         .unwrap();
     let agent = crabber_coworkers::bridge::build_agent_with_behavior(
         def,
+        &crabber_coworkers::workspace::Workspace::disabled(def).unwrap(),
         store,
         scripted("old answer"),
         common::selection(),
@@ -561,6 +595,7 @@ async fn behavior_version_change_keeps_conversation() {
     };
     ask(
         def,
+        &crabber_coworkers::workspace::Workspace::disabled(def).unwrap(),
         "new question",
         provider.clone(),
         common::selection(),
@@ -581,6 +616,7 @@ async fn provider_failure_in_conversation_is_redacted() {
     let provider = Arc::new(FakeProvider::scripted(vec![vec![common::failure(false)]]));
     let error = ask(
         def,
+        &crabber_coworkers::workspace::Workspace::disabled(def).unwrap(),
         "hi",
         provider,
         common::selection(),
@@ -595,6 +631,7 @@ async fn provider_failure_in_conversation_is_redacted() {
     assert_eq!(
         ask(
             def,
+            &crabber_coworkers::workspace::Workspace::disabled(def).unwrap(),
             "again",
             scripted("ok"),
             common::selection(),
@@ -616,6 +653,8 @@ async fn ephemeral_session_writes_nothing() {
     config.state_dir = state.clone();
     ask(
         config.coworker("scout").unwrap(),
+        &crabber_coworkers::workspace::Workspace::disabled(config.coworker("scout").unwrap())
+            .unwrap(),
         "hi",
         scripted("ok"),
         common::selection(),
@@ -641,6 +680,8 @@ async fn durable_turn_deadline_leaves_no_unfinished_run() {
     assert_eq!(
         ask(
             config.coworker("scout").unwrap(),
+            &crabber_coworkers::workspace::Workspace::disabled(config.coworker("scout").unwrap())
+                .unwrap(),
             "hi",
             Arc::new(common::Pending),
             common::selection(),
@@ -708,6 +749,8 @@ async fn expired_deadline_interrupts_after_held_admission_finishes() {
         .unwrap();
     ask(
         config.coworker("scout").unwrap(),
+        &crabber_coworkers::workspace::Workspace::disabled(config.coworker("scout").unwrap())
+            .unwrap(),
         "setup",
         scripted("ok"),
         common::selection(),
@@ -733,6 +776,10 @@ async fn expired_deadline_interrupts_after_held_admission_finishes() {
     let worker = tokio::spawn(async move {
         ask(
             worker_config.coworker("scout").unwrap(),
+            &crabber_coworkers::workspace::Workspace::disabled(
+                worker_config.coworker("scout").unwrap(),
+            )
+            .unwrap(),
             "held admission",
             resolver,
             common::selection(),
@@ -779,6 +826,8 @@ async fn expired_deadline_interrupts_after_held_admission_finishes() {
     assert_eq!(
         ask(
             config.coworker("scout").unwrap(),
+            &crabber_coworkers::workspace::Workspace::disabled(config.coworker("scout").unwrap())
+                .unwrap(),
             "again",
             scripted("ok"),
             common::selection(),

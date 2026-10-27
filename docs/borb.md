@@ -2,8 +2,8 @@
 
 The Slack host keeps its bot identities, authorization, acknowledgements, queues,
 and threaded replies. One persistent borb per coworker runs the complete crabber
-agent and owns that coworker's SQLite database. A mention creates or wakes the
-borb. Independent Slack threads remain separate conversations in that database.
+agent and owns that coworker's SQLite database and workspace files. A mention
+creates or wakes the borb. Independent Slack threads remain separate conversations in that database.
 The host never falls back to a local agent when borb fails.
 
 ## Prepare the worker and access
@@ -12,6 +12,10 @@ The host never falls back to a local agent when borb fails.
 2. Run `scripts/build-worker-image.sh arm64` for the current cluster worker.
    This requires cargo-zigbuild, Zig, Docker, Python 3, and a CA bundle at
    `SSL_CERT_FILE` or `/etc/ssl/cert.pem`. The script builds locally without publishing.
+   The image installs ripgrep at build time and provides `/bin/sh` for catalog
+   validation. The runtime stays unprivileged and exposes neither executable as
+   a model tool. Check the image's UID, `/bin/sh`, `rg --version`, and worker
+   `--version` in a disposable container with no credentials or network.
 3. Obtain the owner's deployment approval before registry or cluster writes.
 4. Publish the image under the cluster's allowed registry prefix and record the
    immutable manifest digest. The observed prefix is `10.0.0.106:30001/borb/`.
@@ -79,8 +83,11 @@ with the published value.
 }
 ```
 
-Keep coworker definitions, Slack allowlists, and turn limits unchanged. Production
-`serve` requires `BORB_TOKEN` and its existing Slack token variables. It does not
+Keep existing coworker definitions, Slack allowlists, and turn limits. Add
+`"workspace": "read_write"` to each coworker that may create or revise files.
+Use `read_only` for read/list access. Omission or `disabled` grants no file tools.
+
+Production `serve` requires `BORB_TOKEN` and its existing Slack token variables. It does not
 need the model key. The worker requires the model key in its environment.
 
 `ask --conversation` and `list-conversations` use the remote database when this
@@ -89,11 +96,52 @@ commands retain their existing local behavior. The provider-injection library
 entry points deliberately remain local for credential-free callers and tests.
 `serve_remote_with` injects a remote executor for integration tests.
 
+The worker admits files only beneath its own
+`<state_dir>/workspaces/<coworker-id>/`. With the default worker state path,
+Scout's files live at `/home/borb/workspace/state/workspaces/scout/` and its
+database remains `/home/borb/workspace/state/scout.sqlite`. The host sends the
+workspace grant, never a root path. Remote turns create no local workspace, and
+`list-conversations` does not create a remote workspace. All authorized users and
+threads of one coworker share that worker's files. The [workspace limits and
+failure semantics](setup.md#workspace-access-and-limits) also apply remotely.
+
+Host and worker now require protocol 2. Health reports version 2, and turn,
+cancellation, and conversation routes use `/v2/`. Version 1 requests and routes
+fail closed. Upgrade the host binary and worker image together. Drain active
+work, stop the host and affected workers, update the immutable image digest,
+and restart with matching versions. Keep workers behind the existing
+authenticated borb proxy. This is not a public file API.
+
 A changed worker image or Secret reference causes an explicit failure while the
 old worker is running. Drain and restart that borb during a controlled upgrade.
 The host does not restart active work automatically. Borb's idle sleep preserves
 its disk. Polling active turns keeps the borb active. The configured cluster
 allows four running borbs, so concurrent coworker capacity remains bounded.
+
+To change workspace grants, drain active work and restart the host and affected
+worker. Revocation keeps existing files and does not undo completed writes.
+After enabling or disabling workspace use, start a new named conversation or
+root Slack mention. Existing sessions whose canonical directory differs fail
+with `cannot use workspace`. Read-only and read/write share the same directory.
+Moving a state directory to a new canonical path also requires new conversations.
+
+To roll back binaries, drain and stop both host and workers, preserve the disk
+and SQLite snapshots, then restore matching host and worker protocol versions
+and the corresponding image digest. Leave workspace files in place. A binary
+rollback does not undo completed file edits. Never reset state to make an old
+conversation's directory match.
+
+## Back up workspace files
+
+The SQLite snapshot and import helpers copy conversation databases only. They do
+not copy `workspaces/`. While all writers are stopped, back up the whole persistent
+coworker disk or copy the workspace directories separately with their private
+ancestor permissions. Do not import links to credentials or private host files.
+
+When files must correspond to their chat history, restore files and the database
+from the same quiesced backup. File replacements and chat commits are independent,
+so a live database snapshot alone cannot establish that correspondence. Keep
+existing files and databases until the replacement has been verified.
 
 ## Move existing conversation history
 
@@ -129,7 +177,9 @@ Compare `list-conversations` with the pre-cutover inventory. Listing initializes
 an existing imported database through its worker-owned connection. Then start the host
 with remote configuration. After any remote turn, rollback requires stopping
 remote writes and exporting a fresh SQLite-consistent remote snapshot. Switching
-back to the old local database would lose newly committed history.
+back to the old local database would lose newly committed history. Copy workspace
+files separately while writers are stopped if you also move deliverables. A
+change of canonical workspace directory requires new conversation names.
 
 ## Verify a real Slack turn
 

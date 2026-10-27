@@ -253,6 +253,8 @@ async fn respond(
                 return Ok(format!("{answer}\n"));
             }
             let resolver = provider.resolve().ok_or(AppError::MissingApiKey)?;
+            let workspace =
+                crate::workspace::admit(def, &config.state_dir, deadline, &mut cancel).await?;
             let session = if let Some(name) = conversation {
                 let store = tokio::select! {
                     biased;
@@ -264,7 +266,10 @@ async fn respond(
             } else {
                 Session::Ephemeral
             };
-            let answer = ask(def, &prompt, resolver, selection, deadline, session, cancel).await?;
+            let answer = ask(
+                def, &workspace, &prompt, resolver, selection, deadline, session, cancel,
+            )
+            .await?;
             Ok(format!("{answer}\n"))
         }
     }

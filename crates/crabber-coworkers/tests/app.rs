@@ -22,6 +22,9 @@ fn config_file() -> tempfile::NamedTempFile {
     let file = tempfile::NamedTempFile::new().unwrap();
     let mut json: serde_json::Value =
         serde_json::from_str(include_str!("../../../config.example.json")).unwrap();
+    for def in json["coworkers"].as_array_mut().unwrap() {
+        def["workspace"] = serde_json::json!("disabled");
+    }
     json["limits"] = serde_json::json!({"model_turn_seconds":1});
     std::fs::write(file.path(), json.to_string()).unwrap();
     file
@@ -439,6 +442,8 @@ async fn list_conversations_while_running() {
     let config = config::load(&file).unwrap();
     let agent = bridge::build_agent(
         config.coworker("scout").unwrap(),
+        &crabber_coworkers::workspace::Workspace::disabled(config.coworker("scout").unwrap())
+            .unwrap(),
         store::open(&config.state_dir, "scout").await.unwrap(),
         Arc::new(common::Pending),
         common::selection(),

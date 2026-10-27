@@ -165,6 +165,7 @@ async fn list_conversations_without_key_while_running() {
     let db = store::open(&config.state_dir, "scout").await.unwrap();
     ask(
         def,
+        &crabber_coworkers::workspace::Workspace::disabled(def).unwrap(),
         "hi",
         Arc::new(FakeProvider::scripted(vec![vec![
             StreamDelta::TextDelta("ok".into()),
@@ -180,8 +181,14 @@ async fn list_conversations_without_key_while_running() {
     )
     .await
     .unwrap();
-    let agent =
-        bridge::build_agent(def, db, Arc::new(common::Pending), common::selection()).unwrap();
+    let agent = bridge::build_agent(
+        def,
+        &crabber_coworkers::workspace::Workspace::disabled(def).unwrap(),
+        db,
+        Arc::new(common::Pending),
+        common::selection(),
+    )
+    .unwrap();
     let run = agent
         .prompt(Some(crabber::SessionId::from("weekly")), "pending")
         .await
@@ -212,6 +219,8 @@ async fn listing_wal_snapshot_does_not_change_database_bytes() {
     let db = store::open(&config.state_dir, "scout").await.unwrap();
     ask(
         config.coworker("scout").unwrap(),
+        &crabber_coworkers::workspace::Workspace::disabled(config.coworker("scout").unwrap())
+            .unwrap(),
         "hi",
         Arc::new(FakeProvider::scripted(vec![vec![
             StreamDelta::TextDelta("ok".into()),

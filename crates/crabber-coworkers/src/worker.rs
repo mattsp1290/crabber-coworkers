@@ -24,7 +24,7 @@ use tokio::sync::{Mutex, Notify, OnceCell, watch};
 use uuid::Uuid;
 
 pub const WORKER_PORT: u16 = 8090;
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 const MAX_ACTIVE: usize = 32;
 const MAX_TERMINAL: usize = 256;
 
@@ -131,26 +131,35 @@ impl Worker {
         mut cancel: watch::Receiver<bool>,
         deadline: tokio::time::Instant,
     ) {
-        let result = match self.store().await {
-            Ok(store) => {
-                ask::ask(
-                    &request.coworker,
-                    &request.prompt,
-                    self.resolver.clone(),
-                    self.selection.clone(),
-                    deadline,
-                    Session::Durable {
-                        store,
-                        name: request.conversation,
-                    },
-                    Box::pin(async move {
-                        let _ = cancel.wait_for(|cancelled| *cancelled).await;
-                    }),
-                )
-                .await
-            }
-            Err(error) => Err(error),
-        };
+        let mut cancel: Cancel = Box::pin(async move {
+            let _ = cancel.wait_for(|cancelled| *cancelled).await;
+        });
+        let result = async {
+            let workspace =
+                crate::workspace::admit(&request.coworker, &self.state_dir, deadline, &mut cancel)
+                    .await?;
+            let store = tokio::select! {
+                biased;
+                () = &mut cancel => return Err(AskError::Interrupted),
+                () = tokio::time::sleep_until(deadline) => return Err(AskError::Timeout),
+                store = self.store() => store?,
+            };
+            ask::ask(
+                &request.coworker,
+                &workspace,
+                &request.prompt,
+                self.resolver.clone(),
+                self.selection.clone(),
+                deadline,
+                Session::Durable {
+                    store,
+                    name: request.conversation,
+                },
+                cancel,
+            )
+            .await
+        }
+        .await;
         self.registry
             .lock()
             .await
@@ -198,9 +207,9 @@ fn worker(
 fn router(worker: Arc<Worker>) -> Router {
     Router::new()
         .route("/healthz", get(health))
-        .route("/v1/turns/{id}", get(status).put(submit))
-        .route("/v1/turns/{id}/cancel", post(cancel))
-        .route("/v1/conversations", get(conversations))
+        .route("/v2/turns/{id}", get(status).put(submit))
+        .route("/v2/turns/{id}/cancel", post(cancel))
+        .route("/v2/conversations", get(conversations))
         .fallback(|| async { fixed(StatusCode::NOT_FOUND) })
         .layer(DefaultBodyLimit::max(MAX_PROMPT_BYTES * 6 + 131_072))
         .with_state(worker)
@@ -230,16 +239,37 @@ pub async fn run(
         return Err(WorkerError);
     }
     let resolver = bridge::opencode_go_resolver_from_env().ok_or(WorkerError)?;
-    let worker = worker(
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .map_err(|_| WorkerError)?;
+    run_with(
         coworker_id,
         state_dir,
         resolver,
         bridge::production_selection(),
-    );
+        listener,
+        cancel,
+    )
+    .await
+}
+
+/// Run the production worker with an injected provider and bound listener.
+///
+/// # Errors
+/// Returns a fixed error for invalid identity or HTTP failures.
+pub async fn run_with(
+    coworker_id: String,
+    state_dir: PathBuf,
+    resolver: Arc<dyn Resolver>,
+    selection: Selection,
+    listener: tokio::net::TcpListener,
+    cancel: Cancel,
+) -> Result<(), WorkerError> {
+    if !crate::config::valid_id(&coworker_id) {
+        return Err(WorkerError);
+    }
+    let worker = worker(coworker_id, state_dir, resolver, selection);
     let app = router(worker.clone());
-    let listener = tokio::net::TcpListener::bind(listen)
-        .await
-        .map_err(|_| WorkerError)?;
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             cancel.await;

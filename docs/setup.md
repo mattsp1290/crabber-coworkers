@@ -2,6 +2,8 @@
 
 Install rustup and Git. The repository's `rust-toolchain.toml` installs Rust `1.99.0` with rustfmt and Clippy. Run commands from the repository root. SQLite is bundled and needs a C compiler: macOS clang or `build-essential` on Debian and Ubuntu.
 
+Enabled workspaces require Unix, an executable `/bin/sh`, and ripgrep (`rg`) on `PATH`. Install ripgrep with `brew install ripgrep` on macOS or `sudo apt-get install ripgrep` on Debian and Ubuntu. The catalog validates these executables even though coworkers expose no shell or search tool. Disabled workspaces, `check-config`, and `list-conversations` do not require ripgrep.
+
 The pinned crabber dependency uses an SSH URL. Configure GitHub SSH access, or use the same HTTPS transport rewrite as CI. To leave global Git configuration untouched, prefix dependency-fetching Cargo commands with:
 
 ```sh
@@ -28,6 +30,7 @@ cargo xtask check
 | `coworkers[].name` | Required | Nonblank after trimming; at most 100 bytes; no control characters |
 | `coworkers[].role` | Required | Nonblank after trimming; at most 200 bytes; no control characters |
 | `coworkers[].instructions` | Required | Nonblank after trimming; at most 16,384 bytes |
+| `coworkers[].workspace` | `disabled` | `disabled`, `read_only`, or `read_write`; unknown values are rejected |
 | `coworkers[].slack` | Optional | Object containing only the following three Slack fields |
 | `coworkers[].slack.team_id` | Required with Slack | `T` followed by 1–31 uppercase ASCII letters or digits |
 | `coworkers[].slack.allowed_channel_ids` | Required with Slack | 1–64 unique IDs; `C` or `G` followed by 1–31 uppercase ASCII letters or digits |
@@ -43,7 +46,7 @@ Provider and model are fixed to `opencode-go` and `deepseek-v4-flash`; neither i
 target/release/crabber-coworkers ask --config config.example.json scout "<prompt>"
 ```
 
-The prompt must contain non-whitespace text and fit the configured byte limit. Without `--conversation`, each invocation starts a fresh in-memory session and writes nothing to disk. The answer prints once the run commits, followed by a newline. Live deltas are withheld so a retry cannot duplicate partial text. The agent has no tools and an explicit deny-all policy.
+The prompt must contain non-whitespace text and fit the configured byte limit. Without `--conversation`, each local invocation starts fresh in-memory chat history. Enabled workspace files persist on disk even without a named conversation or a SQLite file. An unnamed local invocation writes nothing to disk only when workspace access is disabled. The answer prints after the run commits and cleanup succeeds, followed by a newline. Live deltas are withheld so a retry cannot duplicate partial text. The workspace grant selects the available file tools. Every other tool is denied.
 
 | Outcome / stderr message | Exit code |
 | --- | --- |
@@ -65,7 +68,9 @@ The prompt must contain non-whitespace text and fit the configured byte limit. W
 | `prompt is empty` | 2 |
 | `prompt exceeds max_prompt_bytes` | 2 |
 | `OPENCODE_GO_API_KEY is not set` | 2 |
+| `cannot use workspace` | 1 |
 | `agent construction failed` | 1 |
+| `agent cleanup failed` | 1 |
 | `model run failed` | 1 |
 | `model run did not complete` | 1 |
 | `model run produced no answer` | 1 |
@@ -81,20 +86,62 @@ The prompt must contain non-whitespace text and fit the configured byte limit. W
 
 Config and request validation happen before the API-key check or any model request. A completed run without assistant text produces the no-answer error. The pinned runtime rejects a wholly empty model response as a run failure.
 
-The tool never logs credential values, prompt text, answer text, or raw provider errors. Only the requested committed answer goes to stdout. Errors contain fixed messages or redacted configuration paths and rule names.
+The application never logs credential values, prompt text, answer text, file contents, tool arguments or results, or raw provider errors. Only the requested committed answer goes to stdout. Errors contain fixed messages or redacted configuration paths and rule names.
 
 Tests need no credentials or database server. They use temporary SQLite files. If a local proxy is set, set `NO_PROXY=127.0.0.1,localhost` for direct test runs; `cargo xtask check` sets it on its test subprocess. The gate checks formatting, Clippy, workspace tests, the release build, the resolved crabber pin, and the example config, in that order. All dependency resolution is locked.
 
-For `ask`, `limits.model_turn_seconds` starts before the store is opened and covers store open, session creation, admission, every provider retry, and reading the answer. Admission itself is not cancellable; if it finishes after the deadline the run is interrupted at once. On timeout, SIGINT, SIGTERM, or SIGHUP the run is interrupted and the process waits up to 5 seconds for it to settle, so the conversation stays usable. Signal exits use code 130 with `interrupted`. `serve` and `ask` install signal handlers; `check-config` and `list-conversations` keep the default behavior. If the answer completed in the same instant a signal arrived, the answer is printed and the exit code is 0.
+For `ask`, `limits.model_turn_seconds` starts before the store is opened and covers workspace admission, store open, session creation, prompt admission, every provider retry, and reading the answer. Prompt admission itself is not cancellable; if it finishes after the deadline the run is interrupted at once. On timeout, SIGINT, SIGTERM, or SIGHUP the run is interrupted. Once an agent exists, every outcome passes through cleanup with a total wait of at most 5 seconds. A clean interruption leaves the conversation usable, but retained work can outlive that wait. Signal exits use code 130 with `interrupted`. `serve` and `ask` install signal handlers; `check-config` and `list-conversations` keep the default behavior. If the answer completed in the same instant a signal arrived and cleanup succeeds, the answer is printed and the exit code is 0.
+
+## Workspace access and limits
+
+The `workspace` grant belongs to each coworker. It applies to local CLI, local Slack, and borb execution.
+
+| Grant | Available tools | Authority |
+| --- | --- | --- |
+| `disabled`, also the default | None | No workspace admission or file access |
+| `read_only` | `file_read`, `file_list` | Read and list the coworker's files |
+| `read_write` | `file_read`, `file_list`, `file_write`, `file_edit` | Also create, overwrite, and edit files without per-write approval |
+
+The only root is `<state_dir>/workspaces/<coworker-id>/` on the machine that executes the agent. Relative `state_dir` values resolve against that process's working directory. Borb derives the root from its worker state directory, not the host's path. Neither configuration nor tool arguments can choose another root. SQLite files remain outside each workspace.
+
+All authorized users and conversations of a coworker share its files, including conversations in different Slack channels. Chat histories remain separate. The same relative filename refers to the same file across those conversations. Another coworker has a separate root. Grant only users who may read every file in that coworker's workspace. Files read through tools enter the model context and may appear in the requested answer.
+
+First enabled use creates the expected directory. `check-config` and `list-conversations` do not create workspaces. Missing state-directory ancestors are created with mode `0700` on Unix. Existing state-directory ancestors keep their modes. The dedicated `workspaces` directory and coworker root use `0700`, including when reopened. The pinned tools create regular files at `0644`; the private ancestors restrict access to them. There is no recursive permission rewrite.
+
+Admission rejects symlinks or non-directories at either dedicated directory component. File tools reject absolute paths, parent traversal, and access through outward symlinks. Inward symlinks may work. The isolation guarantee excludes imported hard links and hostile filesystem changes by another process with the same Unix user. Do not place links to private host files or credentials in a workspace.
+
+Paths in requests are workspace-relative, such as `drafts/brief.md`. Read a file before asking for an edit. The tools accept UTF-8 text, including source code as text. They never execute files or automatically load them as instructions. There are no shell, search, browser, URL-fetch, delete, move, patch, or connected-app tools.
+
+| Operation | Bound and behavior |
+| --- | --- |
+| Read | A plain read returns a prefix of at most 256 KiB. A line window uses a one-based `offset` and defaults to 2,000 lines, with a maximum `limit` of 5,000. It retains at most 16 KiB per line and caps retained content at 256 KiB. Results identify truncation and the next offset when more lines remain. |
+| List | Lists immediate children by default, or descendants when requested. Results are sorted and capped at 5,000 entries. A truncated listing does not prove that no other files exist. |
+| Write | Creates or overwrites at most 256 KiB. Parent directories must exist unless the tool requests `create_dirs: true`. Empty content produces an empty file. |
+| Edit | Replaces one literal anchor that must occur exactly once. Both the existing file and the edited result must fit 256 KiB. A missing or ambiguous anchor leaves the file unchanged. |
+| Tool capacity | Each agent has four in-flight slots and a two-second combined wait for capacity and the workspace writer lock. The model-turn deadline still applies. |
+
+An oversized write or edit leaves the existing file unchanged. Failed or truncated reads are not evidence of the complete file. Ask for bounded line windows to inspect longer files. There is no total workspace quota, file version history, or conflict detection. Borb's disk limit still applies.
+
+Each file replacement is atomic. Concurrent conversations can overwrite each other's work, and the last successful replacement wins. Reads can see a complete earlier or later version. Writer serialization is process-local. It does not protect against lost updates across processes or serialize an entire conversation turn.
+
+Files and chat history do not commit together. A completed write survives a later model error, timeout, interruption, failed cleanup, or lost Slack reply. A started blocking file operation can finish after cancellation or after the bounded cleanup wait. A hard crash can leave a temporary sibling file or a busy conversation. There is no rollback or automatic replay. Inspect files with read/list before retrying a request.
+
+`cannot use workspace` is the fixed failure for workspace admission or session identity mismatch. Check the executable prerequisites and the expected directory's type, access, and canonical path. `agent cleanup failed` means a run completed but cleanup did not establish that its owned work had ended, so no successful answer is delivered. Neither error includes filesystem contents or raw operating-system errors.
+
+Configuration loads at service startup. To change a grant, drain active work and restart the service and any affected worker. Read-only and read/write use the same canonical root, so subsequent turns apply the new grant without changing the session directory. Revocation retains files and does not undo earlier edits or cancel an already executing tool.
 
 ## Conversations
 
-Start or continue a conversation with `--conversation <name>`. Names follow the coworker-ID rule above. The system prompt is rebuilt from the current config each turn, so editing instructions affects existing conversations.
+Start or continue a conversation with `--conversation <name>`. Names follow the coworker-ID rule above. The system prompt is rebuilt from the loaded config each turn. A new CLI process reads edited instructions immediately. Restart a running service to load configuration changes.
 
 ```sh
 target/release/crabber-coworkers ask --config config.example.json --conversation weekly scout "<prompt>"
 target/release/crabber-coworkers list-conversations --config config.example.json scout
 ```
+
+An enabled session records the workspace's canonical absolute directory and coworker ID. A disabled session records `.` and its coworker ID. Before each turn, the application checks that the stored identity matches the current workspace. It never rewrites an existing session's directory.
+
+After enabling or disabling workspace access, start a new conversation name or a new root Slack mention. Older conversations with a different directory fail with `cannot use workspace`. Moving the state directory to a different canonical path also requires new conversations. Switching between `read_only` and `read_write` at the same root does not require a new name. Existing files and histories remain in place.
 
 Each coworker uses `<state_dir>/<coworker-id>.sqlite`, created on first use. Missing directory components are created with mode `0700` on Unix; the database file is created at `0600` and set to `0600` on every use. An existing directory keeps its mode. Conversation text and the store's internal signing secret are stored in plaintext; the directory and file modes are the only protection. Do not point `state_dir` at a path tracked by git; only `/state/` is ignored.
 

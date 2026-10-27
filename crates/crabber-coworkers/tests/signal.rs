@@ -34,6 +34,7 @@ async fn install_cancel_observes_signals_and_settles_runs() {
             Duration::from_secs(2),
             ask(
                 def,
+                &crabber_coworkers::workspace::Workspace::disabled(def).unwrap(),
                 "hi",
                 Arc::new(common::Pending),
                 common::selection(),
@@ -70,6 +71,7 @@ async fn install_cancel_observes_signals_and_settles_runs() {
         assert_eq!(
             ask(
                 def,
+                &crabber_coworkers::workspace::Workspace::disabled(def).unwrap(),
                 "again",
                 provider,
                 common::selection(),

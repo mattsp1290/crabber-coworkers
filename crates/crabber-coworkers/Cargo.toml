@@ -13,6 +13,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 async-trait = "0.1"
 borb-client = { git = "ssh://git@github.com/mattsp1290/borb.git", rev = "d574ed950d323f81cd9476a892029353c620581b" }
 crabber = { git = "ssh://git@github.com/mattsp1290/crabber.git", rev = "a32b1a83bce10649b56498d7967ab3383490aa51", features = ["opencode-go", "sqlite"] }
+crabber-tools-catalog = { git = "ssh://git@github.com/mattsp1290/crabber.git", rev = "a32b1a83bce10649b56498d7967ab3383490aa51" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "signal", "net", "io-util"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

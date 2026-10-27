@@ -14,13 +14,15 @@
         "allowed_user_ids": [
           "U0000000001"
         ]
-      }
+      },
+      "workspace": "read_write"
     },
     {
       "id": "quill",
       "name": "Quill",
       "role": "Writer",
-      "instructions": "Write clear, concise prose for the intended audience. Preserve the author's meaning and explain any substantive editorial choices."
+      "instructions": "Write clear, concise prose for the intended audience. Preserve the author's meaning and explain any substantive editorial choices.",
+      "workspace": "disabled"
     }
   ]
 }

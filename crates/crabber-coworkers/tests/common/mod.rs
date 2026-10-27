@@ -73,6 +73,9 @@ pub fn write_state_config(
 ) -> std::path::PathBuf {
     let mut config: serde_json::Value =
         serde_json::from_str(include_str!("../../../../config.example.json")).unwrap();
+    for def in config["coworkers"].as_array_mut().unwrap() {
+        def["workspace"] = serde_json::json!("disabled");
+    }
     config["state_dir"] = serde_json::json!(directory.join("state"));
     config["limits"]["model_turn_seconds"] = serde_json::json!(model_turn_seconds);
     let path = directory.join("config.json");
@@ -131,4 +134,53 @@ impl Streamer for Gated {
             ))),
         ))
     }
+}
+
+pub fn tool_call(name: &str, arguments: &serde_json::Value) -> Vec<StreamDelta> {
+    let call_id = crabber::core::ToolCallId::new();
+    vec![
+        StreamDelta::ToolCallStart {
+            call_id: call_id.clone(),
+            name: name.into(),
+        },
+        StreamDelta::ToolCallArgsDelta {
+            call_id: call_id.clone(),
+            text: arguments.to_string(),
+        },
+        StreamDelta::ToolCallDone { call_id },
+        StreamDelta::Completed,
+    ]
+}
+
+pub fn text_answer(answer: &str) -> Vec<StreamDelta> {
+    vec![
+        StreamDelta::TextDelta(answer.into()),
+        StreamDelta::Completed,
+    ]
+}
+
+pub fn tool_results(request: &ModelRequest) -> Vec<serde_json::Value> {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| &message.parts)
+        .filter_map(|part| {
+            if let crabber::core::ContentBlock::ToolResult { content, .. } = &part.content {
+                Some(
+                    content
+                        .iter()
+                        .filter_map(|block| match block {
+                            crabber::core::ContentBlock::Text { text } => {
+                                serde_json::from_str(text).ok()
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .collect()
 }

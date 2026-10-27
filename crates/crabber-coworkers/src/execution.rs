@@ -105,7 +105,7 @@ impl Remote {
             expires_at_unix_ms,
         })
         .map_err(|_| AskError::Run)?;
-        let path = format!("v1/turns/{}", Uuid::new_v4());
+        let path = format!("v2/turns/{}", Uuid::new_v4());
         let result = wait(
             self.turn(&borb, &path, body, deadline),
             deadline,
@@ -133,7 +133,7 @@ impl Remote {
     pub async fn list(&self, def: &CoworkerDefinition) -> Result<String, AskError> {
         let deadline = Instant::now() + LIST_TIMEOUT;
         let borb = self.ensure_running(def, deadline).await?;
-        self.request(&borb, Method::GET, "v1/conversations", None, deadline)
+        self.request(&borb, Method::GET, "v2/conversations", None, deadline)
             .await
     }
 
