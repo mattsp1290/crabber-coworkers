@@ -57,6 +57,8 @@ pub enum ServeError {
     Auth(String),
     #[error(transparent)]
     Store(#[from] store::StoreOpenError),
+    #[error("cannot use workspace")]
+    Workspace,
     #[error("Slack connection stopped for {0}")]
     Connection(String),
     #[error("interrupted")]
@@ -72,7 +74,11 @@ impl ServeError {
             | Self::Borb
             | Self::Credentials(_) => 2,
             Self::Interrupted => 130,
-            Self::Signal | Self::Auth(_) | Self::Store(_) | Self::Connection(_) => 1,
+            Self::Signal
+            | Self::Auth(_)
+            | Self::Store(_)
+            | Self::Connection(_)
+            | Self::Workspace => 1,
         }
     }
 }
@@ -165,12 +171,36 @@ impl Runtime {
     }
 }
 
+struct LocalState {
+    store: Arc<SqliteStore>,
+    workspace: crate::workspace::Workspace,
+}
+
+impl LocalState {
+    async fn open(config: &Config, index: usize, stop: &mut Cancel) -> Result<Self, ServeError> {
+        let def = &config.coworkers[index];
+        let deadline = Instant::now() + Duration::from_secs(config.limits.model_turn_seconds);
+        let workspace = crate::workspace::admit(def, &config.state_dir, deadline, stop)
+            .await
+            .map_err(|error| match error {
+                AskError::Interrupted => ServeError::Interrupted,
+                _ => ServeError::Workspace,
+            })?;
+        let store = tokio::select! {
+            biased;
+            () = &mut *stop => return Err(ServeError::Interrupted),
+            result = store::open(&config.state_dir, &def.id) => result?,
+        };
+        Ok(Self { store, workspace })
+    }
+}
+
 struct Coworker {
     config: Arc<Config>,
     index: usize,
     api: Arc<SlackApi>,
     identity: Identity,
-    store: Option<Arc<SqliteStore>>,
+    local: Option<LocalState>,
     runtime: Arc<Runtime>,
 }
 impl Coworker {
@@ -249,12 +279,8 @@ pub(crate) async fn run(
     });
     let mut ready = Vec::new();
     for (index, api, identity, url) in authenticated {
-        let store = if matches!(runtime.backend, Backend::Local { .. }) {
-            Some(tokio::select! {
-                biased;
-                () = &mut startup_stop => return Err(ServeError::Interrupted),
-                result = store::open(&config.state_dir, &config.coworkers[index].id) => result?,
-            })
+        let local = if matches!(runtime.backend, Backend::Local { .. }) {
+            Some(LocalState::open(&config, index, &mut startup_stop).await?)
         } else {
             None
         };
@@ -264,7 +290,7 @@ pub(crate) async fn run(
                 index,
                 api,
                 identity,
-                store,
+                local,
                 runtime: runtime.clone(),
             }),
             url,
@@ -598,17 +624,19 @@ async fn process_mention(coworker: &Coworker, name: &str, mention: &Mention) -> 
             resolver,
             selection,
         } => {
+            let local = coworker
+                .local
+                .as_ref()
+                .expect("local backend owns its state");
             ask::ask(
                 def,
+                &local.workspace,
                 &mention.text,
                 resolver.clone(),
                 selection.clone(),
                 deadline,
                 Session::Durable {
-                    store: coworker
-                        .store
-                        .clone()
-                        .expect("local backend owns its store"),
+                    store: local.store.clone(),
                     name: name.into(),
                 },
                 stop,
@@ -662,8 +690,11 @@ mod tests {
     #[tokio::test]
     async fn successor_turn_waits_for_idle_drain() {
         let directory = tempfile::tempdir().unwrap();
-        let config: Config =
+        let mut config: Config =
             serde_json::from_str(include_str!("../../../config.example.json")).unwrap();
+        for def in &mut config.coworkers {
+            def.workspace = crate::config::WorkspaceAccess::Disabled;
+        }
         let provider = Arc::new(crabber::FakeProvider::scripted(vec![vec![
             crabber::StreamDelta::TextDelta("ok".into()),
             crabber::StreamDelta::Completed,
@@ -684,6 +715,10 @@ mod tests {
             workers: Mutex::new(JoinSet::new()),
         });
         let coworker = Arc::new(Coworker {
+            local: Some(LocalState {
+                workspace: crate::workspace::Workspace::disabled(&config.coworkers[0]).unwrap(),
+                store: store::open(directory.path(), "scout").await.unwrap(),
+            }),
             config: Arc::new(config),
             index: 0,
             api: Arc::new(
@@ -698,7 +733,6 @@ mod tests {
                 user_id: "UBOT".into(),
                 bot_id: "B1".into(),
             },
-            store: Some(store::open(directory.path(), "scout").await.unwrap()),
             runtime: runtime.clone(),
         });
         // Represent an idle predecessor whose closed queue is still draining.
@@ -745,7 +779,10 @@ mod tests {
         let mut value: serde_json::Value =
             serde_json::from_str(include_str!("../../../config.example.json")).unwrap();
         value["coworkers"][0]["slack"] = serde_json::json!({"team_id":"T1","allowed_channel_ids":["C1"],"allowed_user_ids":["U1"]});
-        let config: Config = serde_json::from_value(value).unwrap();
+        let mut config: Config = serde_json::from_value(value).unwrap();
+        for def in &mut config.coworkers {
+            def.workspace = crate::config::WorkspaceAccess::Disabled;
+        }
         let (stop_tx, stop) = watch::channel(false);
         let (log, _) = mpsc::unbounded_channel();
         let runtime = Arc::new(Runtime {
@@ -762,6 +799,10 @@ mod tests {
             workers: Mutex::new(JoinSet::new()),
         });
         let coworker = Arc::new(Coworker {
+            local: Some(LocalState {
+                workspace: crate::workspace::Workspace::disabled(&config.coworkers[0]).unwrap(),
+                store: store::open(directory.path(), "scout").await.unwrap(),
+            }),
             config: Arc::new(config),
             index: 0,
             api: Arc::new(
@@ -776,7 +817,6 @@ mod tests {
                 user_id: "UBOT".into(),
                 bot_id: "B1".into(),
             },
-            store: Some(store::open(directory.path(), "scout").await.unwrap()),
             runtime,
         });
         (coworker, directory, stop_tx)
@@ -951,10 +991,14 @@ mod tests {
     #[test]
     fn ask_future_is_send() {
         fn assert_send<T: Send>(_: T) {}
-        let config: Config =
+        let mut config: Config =
             serde_json::from_str(include_str!("../../../config.example.json")).unwrap();
+        for def in &mut config.coworkers {
+            def.workspace = crate::config::WorkspaceAccess::Disabled;
+        }
         assert_send(ask::ask(
             &config.coworkers[0],
+            &crate::workspace::Workspace::disabled(&config.coworkers[0]).unwrap(),
             "test",
             Arc::new(crabber::FakeProvider::scripted(vec![])),
             crate::bridge::production_selection(),

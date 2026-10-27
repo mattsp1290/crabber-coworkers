@@ -69,6 +69,8 @@ async fn opencode_go_request_shape() {
         let resolver = opencode_go_resolver("test-key", Some(&url));
         let answer = ask(
             config.coworker("scout").unwrap(),
+            &crabber_coworkers::workspace::Workspace::disabled(config.coworker("scout").unwrap())
+                .unwrap(),
             "ping",
             Arc::clone(&resolver),
             production_selection(),

@@ -142,7 +142,7 @@ async fn handler(State(state): State<Arc<Fake>>, request: Request) -> Response {
             "created_at":"2026-01-01T00:00:00Z", "updated_at":"2026-01-01T00:00:00Z", "deleted_at":null
         })).into_response();
     }
-    if path.ends_with("/v1/conversations") {
+    if path.ends_with("/v2/conversations") {
         return upstream(json!("thread-1\t2026-01-01T00:00:00Z\n"));
     }
     if path.ends_with("/cancel") {
@@ -255,7 +255,7 @@ async fn submits_once_then_polls_and_lists_real_remote_history() {
     assert!(submits[0].body["coworker"]["slack"].is_null());
     assert_eq!(submits[0].body["prompt"], "private-prompt");
     assert_eq!(submits[0].body["conversation"], "thread-1");
-    assert_eq!(submits[0].body["version"], 1);
+    assert_eq!(submits[0].body["version"], 2);
     let expiry = submits[0].body["expires_at_unix_ms"].as_u64().unwrap();
     let now = u64::try_from(
         SystemTime::now()

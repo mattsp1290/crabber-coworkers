@@ -1,12 +1,16 @@
-pub const BEHAVIOR_VERSION: &str = "crabber-coworkers.v1";
+pub const BEHAVIOR_VERSION: &str = "crabber-coworkers.v2";
 
 pub const PROVIDER_ID: &str = "opencode-go";
 pub const MODEL_ID: &str = "deepseek-v4-flash";
 pub const API_KEY_ENV: &str = "OPENCODE_GO_API_KEY";
 
-use crate::config::CoworkerDefinition;
+use crate::{
+    ask::AskError,
+    config::{CoworkerDefinition, WorkspaceAccess},
+    workspace::Workspace,
+};
 use crabber::{
-    Agent, AgentConfig, BuildError, PermissionDecision, Selection, StaticPolicy,
+    Agent, AgentConfig, PermissionDecision, Scope, Selection, StaticPolicy,
     providers::{HttpAdapter, HttpResolver, Protocol, Resolver},
     session::Store,
 };
@@ -14,52 +18,65 @@ use std::sync::Arc;
 
 #[must_use]
 pub fn system_prompt(def: &CoworkerDefinition) -> String {
-    format!(
+    let mut prompt = format!(
         "You are {}, a coworker whose role is: {}.\n\n{}\n",
         def.name, def.role, def.instructions
-    )
+    );
+    if def.workspace != WorkspaceAccess::Disabled {
+        prompt.push_str("\nWorkspace files use relative paths. Report the relative saved path. Read before editing. Only claim a save after a successful tool result. Failed or truncated reads are not complete evidence. Never claim file changes rolled back on cancellation.\n");
+    }
+    prompt
 }
 
-/// Build a tool-free agent with an explicit deny policy.
+/// Build an agent with exactly the admitted workspace tools.
 ///
 /// # Errors
-/// Returns crabber's build error if the supplied runtime components are invalid.
+/// Returns fixed errors for invalid authority, catalog, or runtime components.
 pub fn build_agent(
     def: &CoworkerDefinition,
+    workspace: &Workspace,
     store: Arc<dyn Store>,
     resolver: Arc<dyn Resolver>,
     selection: Selection,
-) -> Result<Agent, BuildError> {
-    build_agent_with_behavior(def, store, resolver, selection, BEHAVIOR_VERSION)
+) -> Result<Agent, AskError> {
+    build_agent_with_behavior(def, workspace, store, resolver, selection, BEHAVIOR_VERSION)
 }
 
-/// Build a tool-free agent with an explicit host behavior version.
+/// Build an agent with admitted tools and an explicit host behavior version.
 ///
 /// # Errors
-/// Returns a build error for invalid runtime components.
+/// Returns fixed errors for invalid authority, catalog, or runtime components.
 pub fn build_agent_with_behavior(
     def: &CoworkerDefinition,
+    workspace: &Workspace,
     store: Arc<dyn Store>,
     resolver: Arc<dyn Resolver>,
     selection: Selection,
     version: &str,
-) -> Result<Agent, BuildError> {
-    Agent::builder()
+) -> Result<Agent, AskError> {
+    workspace.validate(def)?;
+    let policy = workspace.tools().iter().fold(
+        StaticPolicy::new(PermissionDecision::Deny),
+        |policy, tool| policy.with_rule(tool.name(), PermissionDecision::Allow),
+    );
+    let mut builder = Agent::builder()
         .behavior_version(version)
         .store(store)
         .provider(resolver)
         .config(AgentConfig {
             selection,
             workspace_id: def.id.clone(),
-            // No filesystem tools exist; revisit this root before adding them.
-            directory: ".".into(),
+            directory: workspace.directory().into(),
             title: def.name.clone(),
             system_prompt: Some(system_prompt(def)),
             max_output_tokens: None,
             model_controls: crabber::ModelControls::default(),
         })
-        .policy(Arc::new(StaticPolicy::new(PermissionDecision::Deny)))
-        .build()
+        .policy(Arc::new(policy));
+    if let Some(extension) = workspace.extension()? {
+        builder = builder.shared_extension(Arc::new(extension), Scope::Global);
+    }
+    builder.build().map_err(|_| AskError::Build)
 }
 
 #[must_use]

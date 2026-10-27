@@ -43,7 +43,7 @@ impl Server {
     }
 
     fn url(&self, id: Uuid) -> String {
-        format!("{}/v1/turns/{id}", self.base)
+        format!("{}/v2/turns/{id}", self.base)
     }
 
     async fn put(&self, id: Uuid, request: &TurnRequest) -> reqwest::Response {
@@ -122,11 +122,11 @@ async fn durable_history_survives_worker_restart_and_list_is_remote() {
         .unwrap();
     assert_eq!(
         health,
-        json!({"version":1,"coworker_id":"scout","pid":std::process::id()})
+        json!({"version":2,"coworker_id":"scout","pid":std::process::id()})
     );
     let list: String = server
         .client
-        .get(format!("{}/v1/conversations", server.base))
+        .get(format!("{}/v2/conversations", server.base))
         .send()
         .await
         .unwrap()
@@ -156,7 +156,7 @@ async fn durable_history_survives_worker_restart_and_list_is_remote() {
     assert_eq!(provider.requests()[0].messages.len(), 3);
     let list: String = server
         .client
-        .get(format!("{}/v1/conversations", server.base))
+        .get(format!("{}/v2/conversations", server.base))
         .send()
         .await
         .unwrap()
@@ -201,6 +201,7 @@ async fn submit_is_owned_and_busy_and_duplicate_are_distinct() {
         .unwrap();
     let agent = crabber_coworkers::bridge::build_agent(
         &request("weekly").coworker,
+        &crabber_coworkers::workspace::Workspace::disabled(&request("weekly").coworker).unwrap(),
         store,
         Arc::new(common::Pending),
         common::selection(),
@@ -302,7 +303,7 @@ async fn request_validation_and_provider_errors_are_redacted() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(response.text().await.unwrap(), "worker request failed");
     for (field, value) in [
-        ("version", json!(2)),
+        ("version", json!(1)),
         ("conversation", json!("private-question-marker\n")),
         ("prompt", json!(" ")),
         ("prompt", json!("x".repeat(1_048_577))),
@@ -324,6 +325,8 @@ async fn request_validation_and_provider_errors_are_redacted() {
     }
     for (field, value) in [
         ("id", json!("quill")),
+        ("workspace", json!("admin")),
+        ("root", json!("/private-root-marker")),
         ("name", json!("private-question-marker\n")),
         ("role", json!("")),
         ("instructions", json!("x".repeat(16_385))),
@@ -346,7 +349,7 @@ async fn request_validation_and_provider_errors_are_redacted() {
     }
     let response = server
         .client
-        .put(format!("{}/v1/turns/private-question-marker", server.base))
+        .put(format!("{}/v2/turns/private-question-marker", server.base))
         .json(&valid)
         .send()
         .await
@@ -477,7 +480,7 @@ async fn imported_delete_journal_store_lists_before_first_turn() {
     let imported = Server::new(&target, provider.clone()).await;
     let response = imported
         .client
-        .get(format!("{}/v1/conversations", imported.base))
+        .get(format!("{}/v2/conversations", imported.base))
         .send()
         .await
         .unwrap();
@@ -492,4 +495,23 @@ async fn imported_delete_journal_store_lists_before_first_turn() {
     );
     assert_eq!(imported.finished(id).await.unwrap(), "second-answer");
     assert_eq!(provider.requests()[0].messages.len(), 3);
+}
+
+#[tokio::test]
+async fn old_routes_fail_without_provider_or_workspace_access() {
+    let disk = tempfile::tempdir().unwrap();
+    let provider = scripted("unused");
+    let server = Server::new(disk.path(), provider.clone()).await;
+    let mut request = request("stale");
+    request.coworker.workspace = crabber_coworkers::config::WorkspaceAccess::ReadWrite;
+    let response = server
+        .client
+        .put(format!("{}/v1/turns/{}", server.base, Uuid::new_v4()))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(provider.requests().len(), 0);
+    assert!(!disk.path().join("workspaces").exists());
 }
