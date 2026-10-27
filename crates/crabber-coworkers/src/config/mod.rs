@@ -33,6 +33,17 @@ pub struct CoworkerDefinition {
     pub instructions: String,
     #[serde(default)]
     pub slack: Option<SlackConfig>,
+    #[serde(default)]
+    pub workspace: WorkspaceAccess,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceAccess {
+    #[default]
+    Disabled,
+    ReadOnly,
+    ReadWrite,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

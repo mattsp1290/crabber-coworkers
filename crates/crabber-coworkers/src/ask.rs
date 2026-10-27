@@ -36,6 +36,8 @@ pub enum AskError {
     EmptyPrompt,
     #[error("prompt exceeds max_prompt_bytes")]
     PromptTooLarge,
+    #[error("cannot use workspace")]
+    Workspace,
     #[error("agent construction failed")]
     Build,
     #[error("model run failed")]
@@ -57,7 +59,8 @@ impl AskError {
             | Self::PromptTooLarge
             | Self::InvalidConversation => 2,
             Self::Interrupted => 130,
-            Self::Conversation
+            Self::Workspace
+            | Self::Conversation
             | Self::Busy
             | Self::Build
             | Self::Run

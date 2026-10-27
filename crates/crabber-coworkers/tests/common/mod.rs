@@ -73,6 +73,9 @@ pub fn write_state_config(
 ) -> std::path::PathBuf {
     let mut config: serde_json::Value =
         serde_json::from_str(include_str!("../../../../config.example.json")).unwrap();
+    for def in config["coworkers"].as_array_mut().unwrap() {
+        def["workspace"] = serde_json::json!("disabled");
+    }
     config["state_dir"] = serde_json::json!(directory.join("state"));
     config["limits"]["model_turn_seconds"] = serde_json::json!(model_turn_seconds);
     let path = directory.join("config.json");

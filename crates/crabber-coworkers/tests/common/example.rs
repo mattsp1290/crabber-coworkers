@@ -6,5 +6,9 @@ pub fn path() -> PathBuf {
 }
 
 pub fn config() -> Config {
-    config::load(&path()).unwrap()
+    let mut config = config::load(&path()).unwrap();
+    for def in &mut config.coworkers {
+        def.workspace = config::WorkspaceAccess::Disabled;
+    }
+    config
 }
