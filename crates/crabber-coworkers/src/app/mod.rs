@@ -55,6 +55,9 @@ pub enum Command {
         #[arg(long)]
         conversation: Option<String>,
     },
+    /// Print the HTTP API contract document.
+    #[command(hide = true)]
+    Openapi,
 }
 
 pub async fn run(cli: Cli) -> i32 {
@@ -195,6 +198,15 @@ async fn execute(
             }
         };
     }
+    if matches!(cli.command, Command::Openapi) {
+        return match emit(out, &crate::api::openapi::document_json()) {
+            Ok(()) => 0,
+            Err(error) => {
+                let _ = writeln!(err, "{error}");
+                error.exit_code()
+            }
+        };
+    }
     match respond(cli, provider, selection, cancel)
         .await
         .and_then(|output| emit(out, &output))
@@ -214,8 +226,8 @@ async fn respond(
     cancel: Option<Cancel>,
 ) -> Result<String, AppError> {
     match cli.command {
-        Command::Serve { .. } | Command::Worker { .. } => {
-            unreachable!("service commands are dispatched before respond")
+        Command::Serve { .. } | Command::Worker { .. } | Command::Openapi => {
+            unreachable!("service and contract commands are dispatched before respond")
         }
         Command::CheckConfig { config } => Ok(listing(&config::load(&config)?)),
         Command::ListConversations {
