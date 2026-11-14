@@ -7,6 +7,8 @@ use std::{
 };
 
 pub const STORE_FILE_EXTENSION: &str = "sqlite";
+pub const API_STORE_FILE: &str = "api.sqlite";
+pub const API_LOCK_FILE: &str = "api.lock";
 
 #[derive(Debug, thiserror::Error)]
 #[error("cannot open conversation store")]
@@ -39,7 +41,12 @@ pub async fn open(state_dir: &Path, coworker_id: &str) -> Result<Arc<SqliteStore
         .map_err(|_| StoreOpenError)
 }
 
-fn create_private_file(state_dir: &Path, path: &Path) -> Result<(), StoreOpenError> {
+/// Create `state_dir` as a private directory and open `path` inside it as a private file,
+/// refusing a symlink at `path` or at its `-wal`/`-shm` sidecars.
+pub(crate) fn create_private_file(
+    state_dir: &Path,
+    path: &Path,
+) -> Result<fs::File, StoreOpenError> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -66,8 +73,7 @@ fn create_private_file(state_dir: &Path, path: &Path) -> Result<(), StoreOpenErr
             restrict_sidecar(path, suffix)?;
         }
     }
-    drop(file);
-    Ok(())
+    Ok(file)
 }
 
 #[cfg(unix)]

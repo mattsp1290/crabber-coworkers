@@ -164,6 +164,7 @@ impl Config {
             if !ids.insert(&def.id) {
                 errors.push(format!("coworkers[{i}].id must be unique"));
             }
+            errors.extend(reserved_id(i, &def.id));
             let fields = [
                 ("name", &def.name, MAX_NAME_BYTES, true),
                 ("role", &def.role, MAX_ROLE_BYTES, true),
@@ -240,6 +241,11 @@ impl Config {
             Err(ConfigError(errors.join("\n")))
         }
     }
+}
+
+/// A coworker's store is `<state_dir>/<id>.sqlite`, which for `api` would be the API store.
+fn reserved_id(index: usize, id: &str) -> Option<String> {
+    (id == "api").then(|| format!("coworkers[{index}].id must not be api"))
 }
 
 #[must_use]
@@ -496,6 +502,17 @@ mod tests {
                 .to_string()
                 .contains("coworkers[1].id")
         );
+    }
+    #[test]
+    fn api_id_is_reserved() {
+        let mut v = example();
+        v["coworkers"][1]["id"] = json!("api");
+        assert_eq!(
+            parse(&v).unwrap_err().to_string(),
+            "coworkers[1].id must not be api"
+        );
+        v["coworkers"][1]["id"] = json!("api-2");
+        assert!(parse(&v).is_ok());
     }
     #[test]
     fn uppercase_id() {

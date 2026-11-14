@@ -22,6 +22,8 @@ thiserror = "2"
 url = "2"
 time = { version = "0.3", features = ["formatting"] }
 utoipa = { version = "6", features = ["uuid", "preserve_order"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+sha2 = "0.10"
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
