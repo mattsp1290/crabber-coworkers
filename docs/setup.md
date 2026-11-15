@@ -26,7 +26,7 @@ cargo xtask check
 | --- | --- | --- |
 | `state_dir` | Required | Nonblank; at most 4,096 bytes; no control characters. Relative paths resolve against the working directory. `check-config` does not create it. |
 | `coworkers` | Required | 1–32 entries |
-| `coworkers[].id` | Required | Unique; 1–64 bytes; lowercase ASCII letters and digits in groups separated by single hyphens |
+| `coworkers[].id` | Required | Unique; 1–64 bytes; lowercase ASCII letters and digits in groups separated by single hyphens. `api` is reserved. |
 | `coworkers[].name` | Required | Nonblank after trimming; at most 100 bytes; no control characters |
 | `coworkers[].role` | Required | Nonblank after trimming; at most 200 bytes; no control characters |
 | `coworkers[].instructions` | Required | Nonblank after trimming; at most 16,384 bytes |
@@ -35,10 +35,14 @@ cargo xtask check
 | `coworkers[].slack.team_id` | Required with Slack | `T` followed by 1–31 uppercase ASCII letters or digits |
 | `coworkers[].slack.allowed_channel_ids` | Required with Slack | 1–64 unique IDs; `C` or `G` followed by 1–31 uppercase ASCII letters or digits |
 | `coworkers[].slack.allowed_user_ids` | Required with Slack | 1–256 unique IDs; `U` or `W` followed by 1–31 uppercase ASCII letters or digits |
-| `limits.max_concurrent_turns` | 4 | 1–32 model turns across all Slack coworkers |
+| `limits.max_concurrent_turns` | 4 | 1–32 model turns across all Slack coworkers and the HTTP API |
 | `limits` | Optional; defaults below | Object containing only the following fields |
 | `limits.max_prompt_bytes` | 32,768 | 1–1,048,576 bytes |
 | `limits.model_turn_seconds` | 120 | 1–3,600 seconds |
+| `api` | Optional | Object containing only the following three fields. Its presence enables the [HTTP API](#serving-the-http-api) in `serve`. |
+| `api.listen` | `127.0.0.1:8787` | An IP socket address such as `127.0.0.1:8787` or `[::1]:8787`. Host names are rejected. Must be a loopback address unless `api.allow_remote` is `true`. |
+| `api.max_queued_per_conversation` | 16 | 1–256 unfinished requests per conversation, counting the running one |
+| `api.allow_remote` | `false` | Boolean. `true` permits a non-loopback `api.listen`. |
 
 Provider and model are fixed to `opencode-go` and `deepseek-v4-flash`; neither is configurable in JSON. The model credential comes only from `OPENCODE_GO_API_KEY`. See the [live smoke procedure](manual-smoke.md) to set it and run:
 
@@ -60,6 +64,7 @@ The prompt must contain non-whitespace text and fit the configured byte limit. W
 | `coworkers must contain 1–32 entries` | 2 |
 | `coworkers[i].id must be lowercase alphanumeric groups separated by single hyphens, at most 64 bytes` | 2 |
 | `coworkers[i].id must be unique` | 2 |
+| `coworkers[i].id must not be api` | 2 |
 | `coworkers[i].field must not contain control characters` (`name`, `role`) | 2 |
 | `coworkers[i].field must be non-empty and at most N bytes` (limits above) | 2 |
 | `limits.max_prompt_bytes must be in 1..=1048576` | 2 |
@@ -88,7 +93,7 @@ Config and request validation happen before the API-key check or any model reque
 
 The application never logs credential values, prompt text, answer text, file contents, tool arguments or results, or raw provider errors. Only the requested committed answer goes to stdout. Errors contain fixed messages or redacted configuration paths and rule names.
 
-Tests need no credentials or database server. They use temporary SQLite files. If a local proxy is set, set `NO_PROXY=127.0.0.1,localhost` for direct test runs; `cargo xtask check` sets it on its test subprocess. The gate checks formatting, Clippy, workspace tests, the release build, the resolved crabber pin, and the example config, in that order. All dependency resolution is locked.
+Tests need no credentials or database server. They use temporary SQLite files. If a local proxy is set, set `NO_PROXY=127.0.0.1,localhost` for direct test runs; `cargo xtask check` sets it on its test subprocess. The gate checks formatting, Clippy, workspace tests, the release build, the resolved crabber pin, the example config, and the committed OpenAPI document, in that order. A stale document fails with `openapi/crabber-coworkers.v1.json is stale; run cargo xtask openapi`. All dependency resolution is locked.
 
 For `ask`, `limits.model_turn_seconds` starts before the store is opened and covers workspace admission, store open, session creation, prompt admission, every provider retry, and reading the answer. Prompt admission itself is not cancellable; if it finishes after the deadline the run is interrupted at once. On timeout, SIGINT, SIGTERM, or SIGHUP the run is interrupted. Once an agent exists, every outcome passes through cleanup with a total wait of at most 5 seconds. A clean interruption leaves the conversation usable, but retained work can outlive that wait. Signal exits use code 130 with `interrupted`. `serve` and `ask` install signal handlers; `check-config` and `list-conversations` keep the default behavior. If the answer completed in the same instant a signal arrived and cleanup succeeds, the answer is printed and the exit code is 0.
 
@@ -149,7 +154,7 @@ Each coworker uses `<state_dir>/<coworker-id>.sqlite`, created on first use. Mis
 
 There is no per-conversation delete yet: crabber's session-owner cleanup protocol currently prevents deletion after a session has run a prompt. To remove a coworker's conversations, remove its `.sqlite`, `.sqlite-wal`, and `.sqlite-shm` files while no `ask` is running.
 
-A hard crash (SIGKILL, power loss, or a panic) during a turn leaves that conversation reporting `conversation is busy`. Use a new conversation name or remove the coworker's file. Automatic recovery waits on a crabber reconciliation API. A crabber pin bump that changes the SQLite schema version makes existing files unusable (`cannot open conversation store`); archive or remove them before upgrading.
+A hard crash (SIGKILL, power loss, or a panic) during a CLI or Slack turn leaves that conversation reporting `conversation is busy`. Use a new conversation name or remove the coworker's file. CLI and Slack turns have no automatic recovery. HTTP API conversations recover. After a restart, `serve` settles each request that the crash orphaned, once crabber's 30-second lease has expired. See [stops, restarts, and crashes](http-api.md#stops-restarts-and-crashes). A crabber pin bump that changes the SQLite schema version makes existing files unusable (`cannot open conversation store`); archive or remove them before upgrading.
 
 Prompts are currently a command-line argument. Operating-system argument limits can be smaller than `max_prompt_bytes`; for example, Linux commonly limits one argument to about 128 KiB. Such an oversized argument is rejected by the OS before the CLI runs.
 
@@ -181,7 +186,7 @@ SIGINT, SIGTERM, or SIGHUP stops intake, drops queued mentions, interrupts activ
 | `coworkers[i].slack.allowed_channel_ids must contain 1–64 unique Slack channel IDs` | 2 |
 | `coworkers[i].slack.allowed_user_ids must contain 1–256 unique Slack user IDs` | 2 |
 | `limits.max_concurrent_turns must be in 1..=32` | 2 |
-| `no coworker has a slack block` | 2 |
+| `nothing to serve; add a slack block or an api block` | 2 |
 | `<VAR> is not set` | 2 |
 | `<VAR> has the wrong token type` | 2 |
 | `Slack authentication failed for <id>` | 1 |
@@ -193,7 +198,7 @@ SIGINT, SIGTERM, or SIGHUP stops intake, drops queued mentions, interrupts activ
 | `Slack delivery failed for <id>` | stderr log |
 | `Slack event ignored for <id>` | stderr log |
 | `Slack worker failed` | stderr log; worker task ended unexpectedly |
-| `Slack shutdown timed out` | stderr log; remaining tasks aborted |
+| `serve shutdown timed out` | stderr log; remaining tasks aborted |
 
 The transport's library errors are fixed categories: `Slack authentication failed`, `Slack rate limited`, `Slack request failed`, `Slack rejected the request`, and `Slack disabled the Socket Mode link`. The daemon maps them to the coworker-specific messages above. Slack notices are listed in [Slack setup](slack-setup.md).
 
@@ -202,3 +207,73 @@ Acknowledged mentions awaiting an answer are lost if `serve` crashes. Deduplicat
 An operator-named conversation starting with `slack-` can collide with a generated name. Using a thread's conversation simultaneously through `serve` and `ask --conversation` reports busy to whichever comes second. When two coworkers are mentioned under one root message, both answer there and keep separate histories in their respective coworker stores.
 
 Stopping cancels delivery, including a rate-limit wait, without logging a delivery failure. An answer already committed to history may therefore be undelivered or only partly delivered when the process stops. A shutdown that exceeds the 20-second budget aborts remaining tasks and can leave a conversation busy, like a hard crash.
+
+## Serving the HTTP API
+
+Add an `api` block to `config.json` and export the operator token. `serve` then hosts the API, with or without Slack coworkers. The API requires Unix. The consumer contract is [HTTP integration API v1](http-api.md).
+
+```sh
+export CRABBER_COWORKERS_API_TOKEN="$(openssl rand -hex 32)"
+target/release/crabber-coworkers serve --config config.json
+```
+
+| Variable | Rule |
+| --- | --- |
+| `CRABBER_COWORKERS_API_TOKEN` | At least 32 bytes of printable ASCII with no spaces. `serve` reads it once at startup, and only when the `api` block is present. |
+
+The token is an operator credential. It drives every configured coworker with that coworker's workspace grant, including `read_write`. Slack `allowed_user_ids` and `allowed_channel_ids` do not apply to the API. `serve` keeps only the token's SHA-256 digest and never logs the token. To change the token, restart `serve`.
+
+The API serves plaintext HTTP. `api.listen` must be a loopback address unless `api.allow_remote` is `true`. Set `api.allow_remote` only behind a proxy that terminates TLS. `serve` does not check that the proxy exists.
+
+`serve` starts in this order. Each step must succeed before the next one runs.
+
+1. Load and validate the configuration. Require a `slack` block or an `api` block.
+2. Check the model key, or `BORB_TOKEN` when the configuration has a `borb` block.
+3. Check every Slack token variable, and then the API token.
+4. Install signal handlers.
+5. Authenticate each Slack coworker.
+6. Open the coworker stores and workspaces. With an `api` block and the local backend, `serve` opens them for every coworker, not only for Slack coworkers. Every `<coworker-id>.sqlite` therefore exists after startup, and a workspace that cannot be admitted stops startup with `cannot use workspace`.
+7. Lock and open the API store.
+8. Bind `api.listen`.
+9. Resume the requests that an earlier process left, log `API listening on <addr>`, and serve.
+
+Steps 1 to 3 exit 2 before any network call or disk creation.
+
+The API keeps its state in four files under `state_dir`:
+
+- `api.sqlite`, `api.sqlite-wal`, and `api.sqlite-shm` are the database, which runs in WAL mode. Together they hold every API conversation, request text, receipt, and answer in plaintext. Each has mode `0600`, under the same directory rules as the coworker files in [Conversations](#conversations). The directory and file modes are the only protection.
+- `api.lock` is an empty file with mode `0600`. `serve` holds a lock on it while it runs. A second `serve` with an `api` block on the same `state_dir` exits 1 with `API store is in use`.
+
+To remove the API state, stop `serve` and delete all four files. Deleting `api.sqlite` alone can leave prompts and answers in `api.sqlite-wal`.
+
+SIGINT, SIGTERM, or SIGHUP closes intake, interrupts running turns, and keeps queued requests for the next start. SIGUSR1 closes intake, lets running turns finish, and then exits 0. After SIGUSR1, `serve` holds `api.lock` until the running turns end, so a replacement `serve` that starts earlier exits 1 with `API store is in use`. The API is down for that wait, which can last `limits.model_turn_seconds`, and longer while an admission is outstanding. A crash leaves unsettled requests that the next start settles. The receipt statuses for each case are in [stops, restarts, and crashes](http-api.md#stops-restarts-and-crashes).
+
+| Fixed message | Exit code / destination |
+| --- | --- |
+| `api.listen must be a socket address` | 2 |
+| `api.listen must be a loopback address unless api.allow_remote is true` | 2 |
+| `api.max_queued_per_conversation must be in 1..=256` | 2 |
+| `the HTTP API requires Unix` | 2 |
+| `CRABBER_COWORKERS_API_TOKEN is not set` | 2 |
+| `CRABBER_COWORKERS_API_TOKEN must be at least 32 printable bytes` | 2 |
+| `cannot open API store` | 1 |
+| `API store is in use` | 1 |
+| `cannot bind API listener` | 1 |
+| `API server stopped` | 1, after the listener task ended unexpectedly |
+| `API listening on <addr>` | stderr log |
+| `API store write failed` | stderr log |
+| `API store read failed` | stderr log |
+| `API reconciliation failed` | stderr log |
+| `API admission outstanding` | stderr log |
+
+The shared `serve` messages `nothing to serve; add a slack block or an api block`, `interrupted`, `stopped`, and `serve shutdown timed out` are in the [Serving Slack](#serving-slack) table. `coworkers[i].id must not be api` is in the first table. The ID is reserved because that coworker's file would be `<state_dir>/api.sqlite`.
+
+`cannot open API store` covers a filesystem failure, a symlink at any of the four files, a database with an unknown schema version, and a failed read of the pending requests at startup. No API message carries a path, a raw database error, prompt text, or answer text.
+
+Each of these four logs concerns one conversation.
+
+- `API store write failed` and `API store read failed` mean that the dispatcher could not write or read `api.sqlite`. The request stays as it is, and the conversation's later requests wait. The next submission to that conversation, or the next start, settles the request from crabber's state.
+- `API reconciliation failed` means that `serve` could not settle an unsettled request from crabber's state. Either the request waits for the next attempt, or it ended `uncertain` and the conversation's session can stay busy.
+- `API admission outstanding` means that a conversation is held behind an admission that crabber has not answered. `GET /v1/health` counts these in `outstandingAdmissions`. Each one holds one of `limits.max_concurrent_turns`. If the count does not clear, restart `serve`.
+
+After a shutdown that exceeds the 20-second budget, `serve` keeps `api.lock` until the process exits, so no other `serve` can take the store while an admission is still alive.

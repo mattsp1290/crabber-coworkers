@@ -9,7 +9,16 @@ use crabber::{
     providers::Resolver,
     session::{MemoryStore, Store},
 };
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{convert::Infallible, future::Future, pin::Pin, sync::Arc, time::Duration};
+
+mod keyed;
+#[cfg(test)]
+pub(crate) use keyed::read_faults;
+pub use keyed::{
+    KeyedOutcome, KeyedRequest, Orphan, Outstanding, Reconciled, Recovery, Unreadable, Unsettled,
+    abandon_unstarted, ask_keyed, reconcile_keyed, recover_keyed, retire_started,
+};
+
 pub type Cancel = Pin<Box<dyn Future<Output = ()> + Send>>;
 pub const INTERRUPT_SETTLE_SECONDS: u64 = 5;
 pub enum Session {
@@ -113,64 +122,226 @@ pub async fn ask(
     selection: Selection,
     deadline: tokio::time::Instant,
     session: Session,
-    mut cancel: Cancel,
+    cancel: Cancel,
 ) -> Result<String, AskError> {
     let (store, session_id): (Arc<dyn Store>, _) = match session {
         Session::Ephemeral => (Arc::new(MemoryStore::new()), None),
         Session::Durable { store, name } => (store, Some(crabber::SessionId::from(name.as_str()))),
     };
-    let agent = bridge::build_agent(def, workspace, store.clone(), resolver, selection)?;
+    let host = Host {
+        def,
+        workspace,
+        resolver,
+        selection,
+        store,
+    };
+    let (admitted, text) = (session_id.clone(), prompt.to_owned());
+    let mut cancel = Signal::new(cancel);
+    // An unkeyed admission is awaited to its verdict whatever the cancel signal says: nothing
+    // identifies it afterwards, so a wait given up could never be reconciled.
+    let turn = turn::<Infallible, Infallible>(
+        &host,
+        session_id.as_ref(),
+        deadline,
+        &mut cancel,
+        move |agent, _| {
+            Box::pin(async move {
+                let run = agent.prompt(admitted, text).await;
+                run.map(Admitted::Started)
+                    .map_err(|error| admission_error(&error))
+            })
+        },
+    )
+    .await?;
+    match turn {
+        Turn::Answered(answer) => Ok(answer),
+        Turn::Ended(never) | Turn::Outstanding(never) => match never {},
+    }
+}
+
+/// A turn's cancel signal, which can be waited on again after it has fired. [`Cancel`] is any
+/// future, and a future must not be polled once it has completed.
+struct Signal {
+    cancel: Cancel,
+    fired: bool,
+}
+
+impl Signal {
+    fn new(cancel: Cancel) -> Self {
+        Self {
+            cancel,
+            fired: false,
+        }
+    }
+
+    /// Resolves when the signal fires, and at once every time after that.
+    async fn fired(&mut self) {
+        if !self.fired {
+            (&mut self.cancel).await;
+            self.fired = true;
+        }
+    }
+}
+
+/// What one turn runs against.
+struct Host<'a> {
+    def: &'a CoworkerDefinition,
+    workspace: &'a Workspace,
+    resolver: Arc<dyn Resolver>,
+    selection: Selection,
+    store: Arc<dyn Store>,
+}
+
+/// What an admission call granted.
+enum Admitted<R, L> {
+    /// The run's only execution handle. The turn waits for the run as [`answer`] does.
+    Started(crabber::RunHandle),
+    /// The admission started its run and has already waited for it: this is its answer.
+    Answered(String),
+    /// Nothing is left for the turn to wait for, and `R` says why: nothing may execute here, or
+    /// what the admission started has already ended or been given up.
+    Ended(R),
+    /// No verdict yet. Crabber is still working on the admission, and `L` keeps both it and the
+    /// turn's agent alive.
+    Outstanding(L),
+}
+
+type Admitting<'a, R, L> =
+    Pin<Box<dyn Future<Output = Result<Admitted<R, L>, AskError>> + Send + 'a>>;
+
+enum Turn<R, L> {
+    Answered(String),
+    /// The turn has no answer, and `R` says why.
+    Ended(R),
+    /// The turn ended without its admission's verdict and without cleaning up its agent. `L`
+    /// owns both from here on.
+    Outstanding(L),
+}
+
+/// Where a turn failed, relative to the run it was meant to start.
+enum TurnError {
+    /// Before this call started any run.
+    Unstarted(AskError),
+    /// After this call started its run: while [`answer`] waited for the run, or while an
+    /// answered turn's agent was cleaned up.
+    Started(AskError),
+}
+
+impl From<TurnError> for AskError {
+    fn from(error: TurnError) -> Self {
+        match error {
+            TurnError::Unstarted(error) | TurnError::Started(error) => error,
+        }
+    }
+}
+
+fn admission_error(error: &crabber::RuntimeError) -> AskError {
+    match error {
+        crabber::RuntimeError::SessionBusy
+        | crabber::RuntimeError::Store(crabber::session::StoreError::Busy) => AskError::Busy,
+        _ => AskError::Run,
+    }
+}
+
+/// The body every turn shares: build the agent, establish the session, admit through `admit`,
+/// wait for the run under `deadline` and `cancel`, read its committed answer, and clean up.
+/// `admit` is handed the turn's cancel signal so that an admission which can be reconciled
+/// afterwards may stop waiting for crabber's verdict, and may wait for the run it starts in its
+/// own way. It is handed the agent as an [`Arc`] so that such an admission can outlive the turn:
+/// crabber goes on preparing an admission whose waiter is dropped, so one that has no verdict
+/// yet is kept, not dropped.
+async fn turn<R: Send, L: Send>(
+    host: &Host<'_>,
+    session_id: Option<&crabber::SessionId>,
+    deadline: tokio::time::Instant,
+    cancel: &mut Signal,
+    admit: impl for<'a> FnOnce(&'a Arc<crabber::Agent>, &'a mut Signal) -> Admitting<'a, R, L> + Send,
+) -> Result<Turn<R, L>, TurnError> {
+    let Host {
+        def,
+        workspace,
+        resolver,
+        selection,
+        store,
+    } = host;
+    let agent = bridge::build_agent(
+        def,
+        workspace,
+        store.clone(),
+        resolver.clone(),
+        selection.clone(),
+    )
+    .map_err(TurnError::Unstarted)?;
+    let agent = Arc::new(agent);
     let result = async {
-        if let Some(id) = &session_id {
+        if let Some(id) = session_id {
             tokio::select! {
                 biased;
-                () = &mut cancel => return Err(AskError::Interrupted),
-                () = tokio::time::sleep_until(deadline) => return Err(AskError::Timeout),
-                result = ensure_session(&agent, store.as_ref(), def, workspace, id) => result?,
+                () = cancel.fired() => return Err(TurnError::Unstarted(AskError::Interrupted)),
+                () = tokio::time::sleep_until(deadline) => return Err(TurnError::Unstarted(AskError::Timeout)),
+                result = ensure_session(&agent, store.as_ref(), def, workspace, id) => result.map_err(TurnError::Unstarted)?,
             }
         }
         tokio::select! {
             biased;
-            () = &mut cancel => return Err(AskError::Interrupted),
-            () = tokio::time::sleep_until(deadline) => return Err(AskError::Timeout),
+            () = cancel.fired() => return Err(TurnError::Unstarted(AskError::Interrupted)),
+            () = tokio::time::sleep_until(deadline) => return Err(TurnError::Unstarted(AskError::Timeout)),
             () = std::future::ready(()) => {},
         }
-        let run = agent
-            .prompt(session_id, prompt)
-            .await
-            .map_err(|error| match error {
-                crabber::RuntimeError::SessionBusy
-                | crabber::RuntimeError::Store(crabber::session::StoreError::Busy) => {
-                    AskError::Busy
-                }
-                _ => AskError::Run,
-            })?;
-        let control = run.control();
-        let mut done = std::pin::pin!(run.done());
-        let result = match wait_for_completion(done.as_mut(), &mut cancel, deadline).await {
-            Ok(result) => result.map_err(|_| AskError::Run)?,
-            Err(error) => {
-                control.interrupt();
-                return Err(error);
-            }
+        let admitted = admit(&agent, cancel).await;
+        let run = match admitted.map_err(TurnError::Unstarted)? {
+            Admitted::Started(run) => run,
+            Admitted::Answered(answer) => return Ok(Turn::Answered(answer)),
+            Admitted::Ended(reason) => return Ok(Turn::Ended(reason)),
+            Admitted::Outstanding(admission) => return Ok(Turn::Outstanding(admission)),
         };
-        if result.status != RunStatus::Completed {
-            return Err(AskError::NotCompleted);
-        }
-        let messages =
-            tokio::time::timeout_at(deadline, store.list_messages(&result.session_id, None))
-                .await
-                .map_err(|_| AskError::Timeout)?
-                .map_err(|_| AskError::Run)?;
-        committed_text(messages, &result.run_id)
+        answer(store.as_ref(), run, cancel, deadline)
+            .await
+            .map(Turn::Answered)
+            .map_err(TurnError::Started)
     }
     .await;
+    if let Ok(Turn::Outstanding(_)) = &result {
+        // Closing the agent now would not stop the admission, and draining it would only wait
+        // for it. Whoever resolves the admission cleans up.
+        return result;
+    }
     let cleaned = cleanup(&agent).await;
     match result {
-        Ok(answer) if cleaned => Ok(answer),
-        Ok(_) => Err(AskError::Cleanup),
-        Err(error) => Err(error),
+        Ok(Turn::Answered(_)) if !cleaned => Err(TurnError::Started(AskError::Cleanup)),
+        // A turn without an answer reports why whether or not its agent cleaned up: an
+        // admission still being prepared, or a run not seen to end, is exactly what leaves the
+        // agent undrained, and its reason must reach the caller.
+        result => result,
     }
+}
+
+/// Wait for a run and read its answer. A turn given up first interrupts its run and reports why
+/// at once, without waiting to see how the run ends. That suits a turn nobody can ask about
+/// again; a keyed turn stands by its run instead, so that what it reports is what crabber holds.
+async fn answer(
+    store: &dyn Store,
+    run: crabber::RunHandle,
+    cancel: &mut Signal,
+    deadline: tokio::time::Instant,
+) -> Result<String, AskError> {
+    let control = run.control();
+    let mut done = std::pin::pin!(run.done());
+    let result = match wait_for_completion(done.as_mut(), cancel, deadline).await {
+        Ok(result) => result.map_err(|_| AskError::Run)?,
+        Err(error) => {
+            control.interrupt();
+            return Err(error);
+        }
+    };
+    if result.status != RunStatus::Completed {
+        return Err(AskError::NotCompleted);
+    }
+    let messages = tokio::time::timeout_at(deadline, store.list_messages(&result.session_id, None))
+        .await
+        .map_err(|_| AskError::Timeout)?
+        .map_err(|_| AskError::Run)?;
+    committed_text(messages, &result.run_id)
 }
 
 async fn cleanup(agent: &crabber::Agent) -> bool {
@@ -217,13 +388,13 @@ fn drained(report: &crabber::ExecutionTaskDrain) -> bool {
 
 async fn wait_for_completion<F: Future>(
     done: Pin<&mut F>,
-    cancel: &mut Cancel,
+    cancel: &mut Signal,
     deadline: tokio::time::Instant,
 ) -> Result<F::Output, AskError> {
     tokio::select! {
         biased;
         result = done => Ok(result),
-        () = cancel => Err(AskError::Interrupted),
+        () = cancel.fired() => Err(AskError::Interrupted),
         () = tokio::time::sleep_until(deadline) => Err(AskError::Timeout),
     }
 }

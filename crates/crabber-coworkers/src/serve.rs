@@ -1,22 +1,29 @@
-//! Supervise Slack sockets and ordered, durable per-thread workers.
+//! Supervise the frontends: Slack sockets with their ordered, durable per-thread workers, and the
+//! HTTP API with its dispatcher. They share one backend, one turn cap, and one shutdown budget.
 use crate::{
-    app::{Provider, install_cancel},
+    api::{
+        auth::{TokenDigest, TokenError},
+        dispatch::{Dispatcher, Wiring},
+        routes::{self, ApiState},
+        store::{ApiStore, Faults, OpenError},
+    },
+    app::{ServeOptions, install_cancel},
     ask::{self, AskError, Cancel, Session},
-    config::{self, Config},
+    config::{self, ApiConfig, Config},
     slack::{
-        self, CredentialSource,
+        self,
         api::SlackApi,
         delivery,
         ingress::{self, Classified, Identity, Mention},
         socket::{self, Inbound},
     },
     store,
+    turn::{self, Backend, BackendError, LocalError, LocalState, Served, TurnPermits},
 };
-use crabber::{Selection, providers::Resolver, session::SqliteStore};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -29,6 +36,9 @@ use tokio::{
 pub const THREAD_QUEUE: usize = 4;
 pub const RECENT_EVENTS: usize = 1_024;
 pub const SHUTDOWN_SECONDS: u64 = 20;
+/// How long the HTTP API's requests in flight get to finish once intake closes. A client that
+/// stalls past it is cut off, so the rest of the shutdown budget is left for running turns.
+pub const API_GRACE_SECONDS: u64 = 3;
 pub const BUSY_NOTICE_SECONDS: u64 = 30;
 pub const IDLE_SECONDS: u64 = 300;
 
@@ -38,19 +48,24 @@ pub const BUSY_NOTICE: &str =
     "I am still working on earlier messages in this thread. Please try again shortly.";
 pub const TIMEOUT_NOTICE: &str = "I ran out of time answering that.";
 pub const FAILED_NOTICE: &str = "I could not answer that.";
+pub const SHUTDOWN_TIMED_OUT: &str = "serve shutdown timed out";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
     #[error(transparent)]
     Config(#[from] config::ConfigError),
-    #[error("no coworker has a slack block")]
-    NoSlackCoworkers,
+    #[error("nothing to serve; add a slack block or an api block")]
+    NothingToServe,
+    #[error("the HTTP API requires Unix")]
+    Unsupported,
     #[error("OPENCODE_GO_API_KEY is not set")]
     MissingApiKey,
     #[error("cannot configure borb execution; check BORB_TOKEN and borb settings")]
     Borb,
     #[error(transparent)]
     Credentials(#[from] slack::CredentialError),
+    #[error(transparent)]
+    ApiToken(#[from] TokenError),
     #[error("cannot install signal handlers")]
     Signal,
     #[error("Slack authentication failed for {0}")]
@@ -61,24 +76,63 @@ pub enum ServeError {
     Workspace,
     #[error("Slack connection stopped for {0}")]
     Connection(String),
+    #[error("cannot open API store")]
+    ApiStore,
+    #[error("API store is in use")]
+    ApiInUse,
+    #[error("cannot bind API listener")]
+    ApiListen,
+    #[error("API server stopped")]
+    ApiServer,
     #[error("interrupted")]
     Interrupted,
+}
+impl From<BackendError> for ServeError {
+    fn from(error: BackendError) -> Self {
+        match error {
+            BackendError::MissingApiKey => Self::MissingApiKey,
+            BackendError::Borb => Self::Borb,
+        }
+    }
+}
+impl From<OpenError> for ServeError {
+    fn from(error: OpenError) -> Self {
+        match error {
+            OpenError::InUse => Self::ApiInUse,
+            OpenError::Fault => Self::ApiStore,
+        }
+    }
+}
+impl From<LocalError> for ServeError {
+    fn from(error: LocalError) -> Self {
+        match error {
+            LocalError::Interrupted => Self::Interrupted,
+            LocalError::Workspace => Self::Workspace,
+            LocalError::Store(error) => Self::Store(error),
+        }
+    }
 }
 impl ServeError {
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::Config(_)
-            | Self::NoSlackCoworkers
+            | Self::NothingToServe
+            | Self::Unsupported
             | Self::MissingApiKey
             | Self::Borb
-            | Self::Credentials(_) => 2,
+            | Self::Credentials(_)
+            | Self::ApiToken(_) => 2,
             Self::Interrupted => 130,
             Self::Signal
             | Self::Auth(_)
             | Self::Store(_)
             | Self::Connection(_)
-            | Self::Workspace => 1,
+            | Self::Workspace
+            | Self::ApiStore
+            | Self::ApiInUse
+            | Self::ApiListen
+            | Self::ApiServer => 1,
         }
     }
 }
@@ -123,36 +177,9 @@ impl Drop for Supervisor {
     }
 }
 
-enum Backend {
-    Local {
-        resolver: Arc<dyn Resolver>,
-        selection: Selection,
-    },
-    Borb(crate::execution::Remote),
-}
-
-impl Backend {
-    fn new(config: &Config, provider: Provider, selection: Selection) -> Result<Self, ServeError> {
-        Ok(match (&config.borb, provider) {
-            (_, Provider::Remote(remote)) => Self::Borb(remote),
-            (Some(settings), Provider::FromEnv) => Self::Borb(
-                crate::execution::Remote::new(
-                    settings,
-                    std::env::var("BORB_TOKEN").map_err(|_| ServeError::Borb)?,
-                )
-                .map_err(|_| ServeError::Borb)?,
-            ),
-            (_, provider) => Self::Local {
-                resolver: provider.resolve().ok_or(ServeError::MissingApiKey)?,
-                selection,
-            },
-        })
-    }
-}
-
 struct Runtime {
-    backend: Backend,
-    permits: Semaphore,
+    backend: Arc<Backend>,
+    permits: TurnPermits,
     stop: Stop,
     log: Log,
     // A synchronous handler can spawn into this set without awaiting a lock.
@@ -171,36 +198,12 @@ impl Runtime {
     }
 }
 
-struct LocalState {
-    store: Arc<SqliteStore>,
-    workspace: crate::workspace::Workspace,
-}
-
-impl LocalState {
-    async fn open(config: &Config, index: usize, stop: &mut Cancel) -> Result<Self, ServeError> {
-        let def = &config.coworkers[index];
-        let deadline = Instant::now() + Duration::from_secs(config.limits.model_turn_seconds);
-        let workspace = crate::workspace::admit(def, &config.state_dir, deadline, stop)
-            .await
-            .map_err(|error| match error {
-                AskError::Interrupted => ServeError::Interrupted,
-                _ => ServeError::Workspace,
-            })?;
-        let store = tokio::select! {
-            biased;
-            () = &mut *stop => return Err(ServeError::Interrupted),
-            result = store::open(&config.state_dir, &def.id) => result?,
-        };
-        Ok(Self { store, workspace })
-    }
-}
-
 struct Coworker {
     config: Arc<Config>,
     index: usize,
     api: Arc<SlackApi>,
     identity: Identity,
-    local: Option<LocalState>,
+    local: Option<Arc<LocalState>>,
     runtime: Arc<Runtime>,
 }
 impl Coworker {
@@ -215,22 +218,86 @@ impl Coworker {
     }
 }
 
-/// Validate all local inputs and Slack identities before creating any stores.
-#[allow(clippy::too_many_arguments)]
+/// A task the supervisor watches. Any of them ending early stops the service.
+enum Frontend {
+    Slack(String),
+    Api,
+}
+
+/// What the HTTP API leaves for shutdown to finish.
+struct Hosted {
+    dispatcher: Dispatcher,
+    store: ApiStore,
+}
+
+impl Hosted {
+    /// Wait for the dispatcher's tasks. Once intake closes they start no request, and running
+    /// turns settle as they end or as the stop signal interrupts them.
+    fn join(&self) -> Cancel {
+        let dispatcher = self.dispatcher.clone();
+        Box::pin(async move { dispatcher.join().await })
+    }
+
+    /// Give up on the dispatcher's tasks. One of them may have dropped an admission that crabber
+    /// is still preparing, so this process keeps the store's lock until it exits.
+    fn abandon(&self) {
+        self.dispatcher.abort();
+        self.store.keep_lock_until_exit();
+    }
+}
+
+/// The HTTP API, ready to serve.
+struct Api {
+    hosted: Hosted,
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+}
+
+/// The supervised tasks, and which frontend each one is.
+#[derive(Default)]
+struct Tasks {
+    sockets: JoinSet<Result<(), ServeError>>,
+    frontends: HashMap<tokio::task::Id, Frontend>,
+}
+
+impl Tasks {
+    fn spawn(
+        &mut self,
+        frontend: Frontend,
+        task: impl Future<Output = Result<(), ServeError>> + Send + 'static,
+    ) {
+        let id = self.sockets.spawn(task).id();
+        self.frontends.insert(id, frontend);
+    }
+}
+
+/// What the HTTP API takes from [`ServeOptions`].
+struct ApiInputs {
+    token: TokenDigest,
+    listener: Option<tokio::net::TcpListener>,
+    faults: Option<Arc<Faults>>,
+}
+
+/// Serve until a signal arrives. Validates all local inputs, credentials, and Slack identities
+/// before creating any stores.
 pub(crate) async fn run(
     config_path: PathBuf,
-    provider: Provider,
-    credentials: CredentialSource,
-    selection: Selection,
-    cancel: Option<Cancel>,
-    slack_base: &str,
+    options: ServeOptions,
     err: &mut (dyn Write + Send),
 ) -> Result<(), ServeError> {
-    let config = Arc::new(config::load(&config_path)?);
-    if config.slack_coworkers().next().is_none() {
-        return Err(ServeError::NoSlackCoworkers);
-    }
-    let backend = Backend::new(&config, provider, selection)?;
+    let ServeOptions {
+        provider,
+        selection,
+        cancel,
+        renewal,
+        credentials,
+        api_token,
+        api_listener,
+        slack_base,
+        api_faults,
+    } = options;
+    let config = load(&config_path)?;
+    let backend = Arc::new(Backend::new(&config, provider, selection)?);
     let tokens = config
         .coworkers
         .iter()
@@ -238,74 +305,76 @@ pub(crate) async fn run(
         .filter(|(_, def)| def.slack.is_some())
         .map(|(index, def)| credentials.resolve(&def.id).map(|token| (index, token)))
         .collect::<Result<Vec<_>, _>>()?;
+    let api_inputs = match &config.api {
+        Some(_) => Some(ApiInputs {
+            token: api_token.resolve()?,
+            listener: api_listener,
+            faults: api_faults,
+        }),
+        None => None,
+    };
     let cancel = match cancel {
         Some(cancel) => cancel,
         None => install_cancel().map_err(|_| ServeError::Signal)?,
     };
-    let renewal = install_renewal()?;
+    let renewal = match renewal {
+        Some(renewal) => renewal,
+        None => install_renewal()?,
+    };
     let (admission_tx, admission) = watch::channel(false);
     let (stop_tx, stop) = watch::channel(false);
     let _supervisor = Supervisor::notify(cancel, vec![stop_tx.clone(), admission_tx.clone()]);
     let _renewal = Supervisor::notify(renewal, vec![admission_tx.clone()]);
     let mut startup_stop = stop_future(stop.clone());
-    let mut authenticated = Vec::new();
-    for (index, token) in tokens {
-        let def = &config.coworkers[index];
-        let api = Arc::new(
-            SlackApi::new(slack_base, token).map_err(|_| ServeError::Auth(def.id.clone()))?,
-        );
-        let identity = tokio::select! {
-            biased;
-            () = &mut startup_stop => return Err(ServeError::Interrupted),
-            result = api.auth_test() => result.map_err(|_| ServeError::Auth(def.id.clone()))?,
-        };
-        if identity.team_id != def.slack.as_ref().expect("Slack coworker").team_id {
-            return Err(ServeError::Auth(def.id.clone()));
-        }
-        let url = tokio::select! {
-            biased;
-            () = &mut startup_stop => return Err(ServeError::Interrupted),
-            result = api.connections_open() => result.map_err(|_| ServeError::Auth(def.id.clone()))?,
-        };
-        authenticated.push((index, api, identity, url));
-    }
+    let authenticated = authenticate(&config, tokens, &slack_base, &mut startup_stop).await?;
     let (log, mut logs) = mpsc::unbounded_channel();
     let runtime = Arc::new(Runtime {
         backend,
-        permits: Semaphore::new(config.limits.max_concurrent_turns),
+        permits: TurnPermits::new(config.limits.max_concurrent_turns),
         stop: stop.clone(),
         log,
         workers: Mutex::new(JoinSet::new()),
     });
-    let mut ready = Vec::new();
+    let served = served(&config);
+    let locals = turn::open_served(&config, &runtime.backend, served, &mut startup_stop).await?;
+    let opened = open_api(
+        &config,
+        api_inputs,
+        &runtime,
+        &locals,
+        &admission,
+        &mut startup_stop,
+    );
+    let api = opened.await?;
+    let mut tasks = Tasks::default();
+    let hosted = api.map(|api| {
+        if let Ok(address) = api.listener.local_addr() {
+            let _ = writeln!(err, "API listening on {address}");
+        }
+        let serving = serve_api(api.listener, api.router, admission.clone());
+        tasks.spawn(Frontend::Api, serving);
+        api.hosted
+    });
     for (index, api, identity, url) in authenticated {
-        let local = if matches!(runtime.backend, Backend::Local { .. }) {
-            Some(LocalState::open(&config, index, &mut startup_stop).await?)
-        } else {
-            None
-        };
-        ready.push((
-            Arc::new(Coworker {
-                config: config.clone(),
-                index,
-                api,
-                identity,
-                local,
-                runtime: runtime.clone(),
-            }),
-            url,
-        ));
+        let coworker = Arc::new(Coworker {
+            config: config.clone(),
+            index,
+            api,
+            identity,
+            local: locals.get(&config.coworkers[index].id).cloned(),
+            runtime: runtime.clone(),
+        });
+        let frontend = Frontend::Slack(coworker.id().to_owned());
+        tasks.spawn(frontend, coworker_loop(coworker, url, admission.clone()));
     }
-    let mut sockets = JoinSet::new();
-    let mut socket_names = HashMap::new();
-    for (coworker, url) in ready {
-        let name = coworker.id().to_owned();
-        let task = sockets.spawn(coworker_loop(coworker, url, admission.clone()));
-        socket_names.insert(task.id(), name);
-    }
-    let outcome = supervise(&mut sockets, &socket_names, admission, &mut logs, err).await;
+    let Tasks {
+        mut sockets,
+        frontends,
+    } = tasks;
+    let outcome = supervise(&mut sockets, &frontends, admission, &mut logs, err).await;
     let _ = admission_tx.send(true);
-    settle_workers(outcome.is_ok(), &stop_tx, &mut sockets, &runtime).await;
+    let graceful = outcome.is_ok();
+    settle_workers(graceful, &stop_tx, &mut sockets, &runtime, hosted).await;
     while let Ok(line) = logs.try_recv() {
         let _ = writeln!(err, "{line}");
     }
@@ -315,15 +384,159 @@ pub(crate) async fn run(
     outcome
 }
 
+/// The configuration, if it names a frontend that this platform can serve.
+fn load(path: &Path) -> Result<Arc<Config>, ServeError> {
+    let config = config::load(path)?;
+    if config.slack_coworkers().next().is_none() && config.api.is_none() {
+        return Err(ServeError::NothingToServe);
+    }
+    if config.api.is_some() && !cfg!(unix) {
+        return Err(ServeError::Unsupported);
+    }
+    Ok(Arc::new(config))
+}
+
+/// Slack-only deployments open nothing for coworkers that only the API could reach.
+fn served(config: &Config) -> Served {
+    if config.api.is_some() {
+        Served::Every
+    } else {
+        Served::Slack
+    }
+}
+
+type Authenticated = (usize, Arc<SlackApi>, Identity, url::Url);
+
+/// Check each Slack coworker's identity and open its socket URL.
+async fn authenticate(
+    config: &Config,
+    tokens: Vec<(usize, slack::Credentials)>,
+    slack_base: &str,
+    startup_stop: &mut Cancel,
+) -> Result<Vec<Authenticated>, ServeError> {
+    let mut authenticated = Vec::new();
+    for (index, token) in tokens {
+        let def = &config.coworkers[index];
+        let api = Arc::new(
+            SlackApi::new(slack_base, token).map_err(|_| ServeError::Auth(def.id.clone()))?,
+        );
+        let identity = tokio::select! {
+            biased;
+            () = &mut *startup_stop => return Err(ServeError::Interrupted),
+            result = api.auth_test() => result.map_err(|_| ServeError::Auth(def.id.clone()))?,
+        };
+        if identity.team_id != def.slack.as_ref().expect("Slack coworker").team_id {
+            return Err(ServeError::Auth(def.id.clone()));
+        }
+        let url = tokio::select! {
+            biased;
+            () = &mut *startup_stop => return Err(ServeError::Interrupted),
+            result = api.connections_open() => result.map_err(|_| ServeError::Auth(def.id.clone()))?,
+        };
+        authenticated.push((index, api, identity, url));
+    }
+    Ok(authenticated)
+}
+
+/// Open the API store, bind the listener, and set the dispatcher to the requests an earlier
+/// process left. The listener binds before the dispatcher starts, so a failure here leaves no
+/// turn running. Submissions get `503` once `admission` closes. Without `inputs` there is no API.
+async fn open_api(
+    config: &Arc<Config>,
+    inputs: Option<ApiInputs>,
+    runtime: &Runtime,
+    locals: &HashMap<String, Arc<LocalState>>,
+    admission: &Stop,
+    startup_stop: &mut Cancel,
+) -> Result<Option<Api>, ServeError> {
+    let Some(inputs) = inputs else {
+        return Ok(None);
+    };
+    let settings = config.api.clone().unwrap_or_default();
+    let store = tokio::select! {
+        biased;
+        () = &mut *startup_stop => return Err(ServeError::Interrupted),
+        opened = ApiStore::open(&config.state_dir) => opened?,
+    };
+    let store = match inputs.faults {
+        Some(faults) => store.with_faults(faults),
+        None => store,
+    };
+    let listener = match inputs.listener {
+        Some(listener) => listener,
+        None => bind(&settings).await?,
+    };
+    let dispatcher = Dispatcher::new(Wiring {
+        store: store.clone(),
+        backend: runtime.backend.clone(),
+        permits: runtime.permits.clone(),
+        config: config.clone(),
+        locals: locals.clone(),
+        stop: runtime.stop.clone(),
+        intake: admission.clone(),
+        log: runtime.log.clone(),
+    });
+    dispatcher
+        .wake_pending()
+        .await
+        .map_err(|_| ServeError::ApiStore)?;
+    let state = ApiState::new(
+        inputs.token,
+        config.clone(),
+        &runtime.backend,
+        store.clone(),
+        dispatcher.clone(),
+        admission.clone(),
+    );
+    Ok(Some(Api {
+        hosted: Hosted { dispatcher, store },
+        listener,
+        router: routes::router(state),
+    }))
+}
+
+async fn bind(settings: &ApiConfig) -> Result<tokio::net::TcpListener, ServeError> {
+    let address = settings.listen_addr().ok_or(ServeError::ApiListen)?;
+    tokio::net::TcpListener::bind(address)
+        .await
+        .map_err(|_| ServeError::ApiListen)
+}
+
+/// Serve until intake stops, then give the requests in flight [`API_GRACE_SECONDS`] to finish.
+/// Axum bounds no client's headers or body, so one that stalls would otherwise hold the whole
+/// shutdown. Ending any earlier is a failure.
+async fn serve_api(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+    admission: Stop,
+) -> Result<(), ServeError> {
+    let serving =
+        axum::serve(listener, router).with_graceful_shutdown(stop_future(admission.clone()));
+    let closed = stop_future(admission.clone());
+    tokio::select! {
+        _ = std::future::IntoFuture::into_future(serving) => {},
+        () = async {
+            closed.await;
+            tokio::time::sleep(Duration::from_secs(API_GRACE_SECONDS)).await;
+        } => {},
+    }
+    if *admission.borrow() {
+        Ok(())
+    } else {
+        Err(ServeError::ApiServer)
+    }
+}
+
 async fn settle_workers(
     graceful: bool,
     stop: &watch::Sender<bool>,
     sockets: &mut JoinSet<Result<(), ServeError>>,
     runtime: &Runtime,
+    api: Option<Hosted>,
 ) {
     if graceful && !*runtime.stop.borrow() {
         let timed_out = {
-            let finish = finish_workers(sockets, runtime);
+            let finish = finish_workers(sockets, runtime, api.as_ref().map(Hosted::join));
             tokio::pin!(finish);
             tokio::select! {
                 biased;
@@ -334,18 +547,17 @@ async fn settle_workers(
             }
         };
         if timed_out {
-            let _ = runtime.log.send("Slack shutdown timed out".into());
-            sockets.abort_all();
+            abandon(sockets, runtime, api.as_ref());
             while sockets.join_next().await.is_some() {}
         }
     } else {
-        shutdown(stop, sockets, runtime).await;
+        shutdown(stop, sockets, runtime, api).await;
     }
 }
 
 async fn supervise(
     sockets: &mut JoinSet<Result<(), ServeError>>,
-    socket_names: &HashMap<tokio::task::Id, String>,
+    frontends: &HashMap<tokio::task::Id, Frontend>,
     stop: Stop,
     logs: &mut mpsc::UnboundedReceiver<String>,
     err: &mut (dyn Write + Send),
@@ -356,7 +568,10 @@ async fn supervise(
             () = stop_future(stop.clone()) => break Ok(()),
             result = sockets.join_next_with_id() => match result {
                 Some(Ok((_, Err(error)))) => break Err(error),
-                Some(Err(error)) => break Err(ServeError::Connection(socket_names[&error.id()].clone())),
+                Some(Err(error)) => break Err(match &frontends[&error.id()] {
+                    Frontend::Slack(name) => ServeError::Connection(name.clone()),
+                    Frontend::Api => ServeError::ApiServer,
+                }),
                 Some(Ok((id, Ok(())))) => { let _ = id; },
                 None => break Ok(()),
             },
@@ -369,27 +584,41 @@ async fn shutdown(
     stop: &watch::Sender<bool>,
     sockets: &mut JoinSet<Result<(), ServeError>>,
     runtime: &Runtime,
+    api: Option<Hosted>,
 ) {
     let _ = stop.send(true);
     if tokio::time::timeout(
         Duration::from_secs(SHUTDOWN_SECONDS),
-        finish_workers(sockets, runtime),
+        finish_workers(sockets, runtime, api.as_ref().map(Hosted::join)),
     )
     .await
     .is_err()
     {
-        let _ = runtime.log.send("Slack shutdown timed out".into());
-        sockets.abort_all();
-        runtime
-            .workers
-            .lock()
-            .expect("worker set poisoned")
-            .abort_all();
+        abandon(sockets, runtime, api.as_ref());
         while sockets.join_next().await.is_some() {}
     }
 }
 
-async fn finish_workers(sockets: &mut JoinSet<Result<(), ServeError>>, runtime: &Runtime) {
+/// The shutdown budget ran out: abort every task that is left. The caller then reaps them.
+fn abandon(sockets: &mut JoinSet<Result<(), ServeError>>, runtime: &Runtime, api: Option<&Hosted>) {
+    let _ = runtime.log.send(SHUTDOWN_TIMED_OUT.into());
+    sockets.abort_all();
+    runtime
+        .workers
+        .lock()
+        .expect("worker set poisoned")
+        .abort_all();
+    if let Some(api) = api {
+        api.abandon();
+    }
+}
+
+/// Wait for the sockets, then the Slack workers, then `api`, the dispatcher's join.
+async fn finish_workers(
+    sockets: &mut JoinSet<Result<(), ServeError>>,
+    runtime: &Runtime,
+    api: Option<Cancel>,
+) {
     while sockets.join_next().await.is_some() {}
     let mut workers = {
         let mut set = runtime.workers.lock().expect("worker set poisoned");
@@ -399,6 +628,9 @@ async fn finish_workers(sockets: &mut JoinSet<Result<(), ServeError>>, runtime: 
         if result.is_err() {
             let _ = runtime.log.send("Slack worker failed".into());
         }
+    }
+    if let Some(api) = api {
+        api.await;
     }
 }
 
@@ -615,11 +847,11 @@ async fn process_mention(coworker: &Coworker, name: &str, mention: &Mention) -> 
     let permit = tokio::select! {
         biased;
         () = &mut stop => return false,
-        result = coworker.runtime.permits.acquire() => result.expect("semaphore stays open"),
+        permit = coworker.runtime.permits.acquire() => permit,
     };
     let deadline = Instant::now() + Duration::from_secs(coworker.config.limits.model_turn_seconds);
     let def = &coworker.config.coworkers[coworker.index];
-    let answer = match &coworker.runtime.backend {
+    let answer = match coworker.runtime.backend.as_ref() {
         Backend::Local {
             resolver,
             selection,
@@ -686,6 +918,7 @@ async fn notice(coworker: &Coworker, mention: &Mention, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crabber::Selection;
 
     #[tokio::test]
     async fn successor_turn_waits_for_idle_drain() {
@@ -702,23 +935,23 @@ mod tests {
         let (stop_tx, stop) = watch::channel(false);
         let (log, _) = mpsc::unbounded_channel();
         let runtime = Arc::new(Runtime {
-            backend: Backend::Local {
+            backend: Arc::new(Backend::Local {
                 resolver: provider.clone(),
                 selection: Selection {
                     provider_id: "fake".into(),
                     model_id: "scripted".into(),
                 },
-            },
-            permits: Semaphore::new(1),
+            }),
+            permits: TurnPermits::new(1),
             stop,
             log,
             workers: Mutex::new(JoinSet::new()),
         });
         let coworker = Arc::new(Coworker {
-            local: Some(LocalState {
+            local: Some(Arc::new(LocalState {
                 workspace: crate::workspace::Workspace::disabled(&config.coworkers[0]).unwrap(),
                 store: store::open(directory.path(), "scout").await.unwrap(),
-            }),
+            })),
             config: Arc::new(config),
             index: 0,
             api: Arc::new(
@@ -770,7 +1003,7 @@ mod tests {
         })
         .await
         .unwrap();
-        shutdown(&stop_tx, &mut JoinSet::new(), &runtime).await;
+        shutdown(&stop_tx, &mut JoinSet::new(), &runtime, None).await;
         assert_eq!(provider.requests().len(), 1);
     }
 
@@ -786,23 +1019,23 @@ mod tests {
         let (stop_tx, stop) = watch::channel(false);
         let (log, _) = mpsc::unbounded_channel();
         let runtime = Arc::new(Runtime {
-            backend: Backend::Local {
+            backend: Arc::new(Backend::Local {
                 resolver: Arc::new(crabber::FakeProvider::scripted(vec![])),
                 selection: Selection {
                     provider_id: "fake".into(),
                     model_id: "scripted".into(),
                 },
-            },
-            permits: Semaphore::new(0),
+            }),
+            permits: TurnPermits::new(0),
             stop,
             log,
             workers: Mutex::new(JoinSet::new()),
         });
         let coworker = Arc::new(Coworker {
-            local: Some(LocalState {
+            local: Some(Arc::new(LocalState {
                 workspace: crate::workspace::Workspace::disabled(&config.coworkers[0]).unwrap(),
                 store: store::open(directory.path(), "scout").await.unwrap(),
-            }),
+            })),
             config: Arc::new(config),
             index: 0,
             api: Arc::new(
@@ -901,7 +1134,7 @@ mod tests {
                 .unwrap()
                 >= last
         );
-        shutdown(&stop, &mut JoinSet::new(), &coworker.runtime).await;
+        shutdown(&stop, &mut JoinSet::new(), &coworker.runtime, None).await;
         drop(predecessor_queue);
         assert_eq!(slots.available_permits(), THREAD_QUEUE);
     }
@@ -911,22 +1144,94 @@ mod tests {
         let (stop_tx, stop) = watch::channel(false);
         let (log, mut logs) = mpsc::unbounded_channel();
         let runtime = Runtime {
-            backend: Backend::Local {
+            backend: Arc::new(Backend::Local {
                 resolver: Arc::new(crabber::FakeProvider::scripted(vec![])),
                 selection: Selection {
                     provider_id: "fake".into(),
                     model_id: "scripted".into(),
                 },
-            },
-            permits: Semaphore::new(1),
+            }),
+            permits: TurnPermits::new(1),
             stop,
             log,
             workers: Mutex::new(JoinSet::new()),
         };
         runtime.spawn(std::future::pending());
-        shutdown(&stop_tx, &mut JoinSet::new(), &runtime).await;
-        assert_eq!(logs.try_recv().unwrap(), "Slack shutdown timed out");
+        shutdown(&stop_tx, &mut JoinSet::new(), &runtime, None).await;
+        assert_eq!(logs.try_recv().unwrap(), SHUTDOWN_TIMED_OUT);
         assert!(runtime.workers.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stranded_admission_is_abandoned_at_the_budget_and_keeps_the_lock() {
+        use crate::api::{
+            contract::{ApiUuid, CoworkerId},
+            dispatch::ADMISSION_OUTSTANDING,
+            store::{MarkedRunning, Submitted},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let mut config: Config =
+            serde_json::from_str(include_str!("../../../config.example.json")).unwrap();
+        config.state_dir = directory.path().to_path_buf();
+        for def in &mut config.coworkers {
+            def.workspace = crate::config::WorkspaceAccess::Disabled;
+        }
+        let backend = Backend::Local {
+            resolver: Arc::new(crabber::FakeProvider::scripted(vec![])),
+            selection: Selection {
+                provider_id: "fake".into(),
+                model_id: "scripted".into(),
+            },
+        };
+        let mut never: Cancel = Box::pin(std::future::pending());
+        let locals = turn::open_all(&config, &backend, &mut never).await.unwrap();
+        let store = ApiStore::open(directory.path()).await.unwrap();
+        let conversation = ApiUuid::parse("00000000-0000-0000-0000-000000000001").unwrap();
+        let request = ApiUuid::parse("00000000-0000-0000-0000-00000000000a").unwrap();
+        let scout = CoworkerId::parse("scout").unwrap();
+        store.open_conversation(conversation, &scout).await.unwrap();
+        let submitted = store.submit(conversation, request, "synthetic request", 16);
+        let Submitted::Inserted(row) = submitted.await.unwrap() else {
+            panic!("a new request is inserted");
+        };
+        let MarkedRunning::Started(row) = store.mark_running(row.seq()).await.unwrap() else {
+            panic!("a queued request starts");
+        };
+        let (stop_tx, stop) = watch::channel(false);
+        let (log, mut logs) = mpsc::unbounded_channel();
+        let runtime = Runtime {
+            backend: Arc::new(backend),
+            permits: TurnPermits::new(1),
+            stop: stop.clone(),
+            log: log.clone(),
+            workers: Mutex::new(JoinSet::new()),
+        };
+        let dispatcher = Dispatcher::new(Wiring {
+            store: store.clone(),
+            backend: runtime.backend.clone(),
+            permits: runtime.permits.clone(),
+            config: Arc::new(config),
+            locals,
+            stop: stop.clone(),
+            intake: stop,
+            log,
+        });
+        dispatcher.strand(&row).await;
+        let hosted = Hosted { dispatcher, store };
+
+        let began = Instant::now();
+        shutdown(&stop_tx, &mut JoinSet::new(), &runtime, Some(hosted)).await;
+        let took = began.elapsed();
+        assert!(took >= Duration::from_secs(SHUTDOWN_SECONDS), "{took:?}");
+        assert!(took < Duration::from_secs(SHUTDOWN_SECONDS + 5), "{took:?}");
+        assert_eq!(logs.try_recv().unwrap(), ADMISSION_OUTSTANDING);
+        assert_eq!(logs.try_recv().unwrap(), SHUTDOWN_TIMED_OUT);
+        // The aborted admission let go of its handles; the process still holds the lock.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(matches!(
+            ApiStore::open(directory.path()).await,
+            Err(OpenError::InUse)
+        ));
     }
 
     #[tokio::test]
@@ -956,10 +1261,14 @@ mod tests {
             2
         ]));
         let runtime = Arc::get_mut(&mut Arc::get_mut(&mut coworker).unwrap().runtime).unwrap();
-        if let Backend::Local { resolver, .. } = &mut runtime.backend {
-            *resolver = provider.clone();
-        }
-        runtime.permits.add_permits(1);
+        runtime.backend = Arc::new(Backend::Local {
+            resolver: provider.clone(),
+            selection: Selection {
+                provider_id: "fake".into(),
+                model_id: "scripted".into(),
+            },
+        });
+        runtime.permits = TurnPermits::new(1);
         let (sender, mut receiver) = mpsc::channel(THREAD_QUEUE);
         let slots = Arc::new(Semaphore::new(THREAD_QUEUE));
         for id in ["first", "second"] {

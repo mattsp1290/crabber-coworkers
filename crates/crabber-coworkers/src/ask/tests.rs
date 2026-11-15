@@ -2,10 +2,25 @@ use super::*;
 #[tokio::test]
 async fn completed_answer_wins_when_signal_and_deadline_are_ready() {
     let mut done = std::pin::pin!(std::future::ready("committed answer"));
-    let mut cancel: Cancel = Box::pin(std::future::ready(()));
+    let mut cancel = Signal::new(Box::pin(std::future::ready(())));
     assert_eq!(
         wait_for_completion(done.as_mut(), &mut cancel, tokio::time::Instant::now()).await,
         Ok("committed answer")
+    );
+}
+
+#[tokio::test]
+async fn a_fired_signal_stays_fired() {
+    // An `async` block panics when it is polled after it has completed.
+    let mut cancel = Signal::new(Box::pin(async {}));
+    for _ in 0..3 {
+        cancel.fired().await;
+    }
+    let mut done = std::pin::pin!(std::future::pending::<()>());
+    let far = tokio::time::Instant::now() + Duration::from_secs(60);
+    assert_eq!(
+        wait_for_completion(done.as_mut(), &mut cancel, far).await,
+        Err(AskError::Interrupted)
     );
 }
 

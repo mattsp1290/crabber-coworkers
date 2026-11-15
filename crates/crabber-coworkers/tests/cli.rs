@@ -286,7 +286,10 @@ fn serve_requires_slack_coworker() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
-    assert_eq!(output.stderr, b"no coworker has a slack block\n");
+    assert_eq!(
+        output.stderr,
+        b"nothing to serve; add a slack block or an api block\n"
+    );
     assert_eq!(output.stdout, b"");
     assert!(!temp.path().join("state").exists());
 }

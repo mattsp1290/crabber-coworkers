@@ -1,13 +1,19 @@
 mod pins;
 use serde_json::Value;
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
+
+const OPENAPI_DOCUMENT: &str = "openapi/crabber-coworkers.v1.json";
 
 fn main() -> ExitCode {
-    if std::env::args().skip(1).collect::<Vec<_>>() != ["check"] {
-        eprintln!("usage: cargo xtask check");
-        return ExitCode::from(2);
-    }
-    match check() {
+    let task = match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
+        [task] if task == "check" => check,
+        [task] if task == "openapi" => openapi,
+        _ => {
+            eprintln!("usage: cargo xtask check|openapi");
+            return ExitCode::from(2);
+        }
+    };
+    match task() {
         Ok(()) => ExitCode::SUCCESS,
         Err(step) => {
             eprintln!("{step}");
@@ -87,12 +93,49 @@ fn check() -> Result<(), String> {
         .with_extension(std::env::consts::EXE_EXTENSION);
     run(
         "example config check",
-        Command::new(binary).current_dir(workspace_root()).args([
+        Command::new(&binary).current_dir(workspace_root()).args([
             "check-config",
             "--config",
             "config.example.json",
         ]),
-    )
+    )?;
+    let generated = generated_openapi(Command::new(&binary).arg("openapi"))?;
+    let committed = std::fs::read(workspace_root().join(OPENAPI_DOCUMENT)).unwrap_or_default();
+    if generated != committed {
+        return Err(format!(
+            "{OPENAPI_DOCUMENT} is stale; run cargo xtask openapi"
+        ));
+    }
+    Ok(())
+}
+
+fn openapi() -> Result<(), String> {
+    let generated = generated_openapi(&mut cargo(&[
+        "run",
+        "--locked",
+        "-q",
+        "-p",
+        "crabber-coworkers",
+        "--",
+        "openapi",
+    ]))?;
+    let root = workspace_root();
+    std::fs::create_dir_all(root.join("openapi"))
+        .and_then(|()| std::fs::write(root.join(OPENAPI_DOCUMENT), generated))
+        .map_err(|_| format!("cannot write {OPENAPI_DOCUMENT}"))
+}
+
+fn generated_openapi(command: &mut Command) -> Result<Vec<u8>, String> {
+    let step = "openapi contract";
+    // stdout is the document; stderr stays visible so a build failure shows its diagnostics.
+    let output = command
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|_| step)?;
+    if !output.status.success() {
+        return Err(step.into());
+    }
+    Ok(output.stdout)
 }
 
 fn verify_crabber_source(metadata: &Value, rev: &str) -> bool {

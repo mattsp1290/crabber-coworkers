@@ -24,5 +24,8 @@
       "instructions": "Write clear, concise prose for the intended audience. Preserve the author's meaning and explain any substantive editorial choices.",
       "workspace": "disabled"
     }
-  ]
+  ],
+  "api": {
+    "listen": "127.0.0.1:8787"
+  }
 }

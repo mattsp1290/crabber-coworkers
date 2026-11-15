@@ -1,6 +1,6 @@
 # crabber-coworkers
 
-A Rust port of the OpenDots idea of always-on AI coworkers, built on crabber. It answers prompts from configured coworkers on the command line and Slack, with durable conversations.
+A Rust port of the OpenDots idea of always-on AI coworkers, built on crabber. It answers prompts from configured coworkers on the command line, in Slack, and over an HTTP API, with durable conversations.
 
 ```sh
 cargo build -p crabber-coworkers --release --locked
@@ -18,6 +18,14 @@ For Kubernetes agent execution, see [running coworkers in borb](docs/borb.md). S
 
 See [setup](docs/setup.md) for configuration and [manual smoke testing](docs/manual-smoke.md) for an optional live check.
 
+With an `api` block in the configuration, `serve` also hosts an authenticated HTTP API, by default on `127.0.0.1:8787`. A client opens a conversation, submits a request, and polls its receipt until the request completes. Export a token of at least 32 bytes of printable ASCII with no spaces as `CRABBER_COWORKERS_API_TOKEN` before you start `serve`, and send it as a bearer token:
+
+```sh
+curl -sS -H "Authorization: Bearer $CRABBER_COWORKERS_API_TOKEN" http://127.0.0.1:8787/v1/coworkers
+```
+
+See the [HTTP API contract](docs/http-api.md). Generate clients from [`openapi/crabber-coworkers.v1.json`](openapi/crabber-coworkers.v1.json). `cargo xtask openapi` regenerates that document, and `cargo xtask check` rejects a stale one.
+
 Coworkers can create, list, read, and revise text files in a persistent workspace. Set `workspace` to `read_write` for those four file tools, `read_only` for read/list, or `disabled` for no tools. Omitted grants default to `disabled`. The example enables Scout and disables Quill.
 
 ```sh
@@ -26,7 +34,7 @@ target/release/crabber-coworkers ask --config config.example.json scout "Read br
 target/release/crabber-coworkers ask --config config.example.json scout "Read brief.md, then add an item to review the draft."
 ```
 
-All authorized users and conversations of a coworker share its files. Local files live in `<state_dir>/workspaces/<coworker-id>/`; borb workers keep them on their own persistent disk. The tools cannot run shell commands, fetch URLs, or publish files. Retrieve files through ordinary read/list requests and the resulting CLI answer or Slack reply. See [workspace access and limits](docs/setup.md#workspace-access-and-limits).
+All authorized users and conversations of a coworker share its files. Local files live in `<state_dir>/workspaces/<coworker-id>/`; borb workers keep them on their own persistent disk. The tools cannot run shell commands, fetch URLs, or publish files. Retrieve files through ordinary read/list requests and the resulting CLI answer, Slack reply, or API receipt. See [workspace access and limits](docs/setup.md#workspace-access-and-limits).
 
 Without `--conversation`, each local `ask` uses fresh in-memory chat history. Workspace files still persist when enabled. With workspace access disabled, an unnamed local `ask` writes nothing to disk. Named conversations persist under `state_dir` as one SQLite file per coworker.
 

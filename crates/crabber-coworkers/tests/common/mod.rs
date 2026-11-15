@@ -66,13 +66,15 @@ pub fn never() -> crabber_coworkers::ask::Cancel {
     Box::pin(std::future::pending())
 }
 
-/// Write an isolated example config with an explicit model-turn limit.
+/// Write an isolated example config with an explicit model-turn limit and without the HTTP API,
+/// which a test enables by adding an `api` block.
 pub fn write_state_config(
     directory: &std::path::Path,
     model_turn_seconds: u64,
 ) -> std::path::PathBuf {
     let mut config: serde_json::Value =
         serde_json::from_str(include_str!("../../../../config.example.json")).unwrap();
+    config.as_object_mut().unwrap().remove("api");
     for def in config["coworkers"].as_array_mut().unwrap() {
         def["workspace"] = serde_json::json!("disabled");
     }

@@ -1,0 +1,1085 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "crabber-coworkers integration API",
+    "description": "Every `/v1` route this server exposes is in this document, and every route requires the bearer token. Byte limits come from the configured `limits`: `x-maxUtf8Bytes` is the hard ceiling, and `GET /v1/capabilities` reports the values in force.",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    },
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/v1/capabilities": {
+      "get": {
+        "description": "Contract identifiers, the execution backend, and the configured limits. A pure read; repeat it freely. Reject an unsupported `apiVersion` or `requestContract` before submitting.",
+        "operationId": "capabilities",
+        "responses": {
+          "200": {
+            "description": "Capabilities.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Capabilities"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/conversations": {
+      "get": {
+        "description": "Conversations opened through this API, in ascending `conversationId` order, which is not chronological. Send `next` back as `after` with the same parameters to read the following page; `null` marks the last page. A pure read; repeat it freely.",
+        "operationId": "listConversations",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size from 1 to 100 in decimal, without sign or leading zeros. Defaults to 50.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "maximum": 100,
+              "minimum": 1
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "description": "The previous page's `next`, unchanged.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            }
+          },
+          {
+            "name": "coworkerId",
+            "in": "query",
+            "description": "Only this coworker's conversations. An unconfigured coworker yields an empty page.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One page of conversations.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      },
+      "post": {
+        "description": "Open a conversation under a client-chosen `conversationId`. Idempotent: repeating it with the same `coworkerId` returns 201 with the current snapshot, and another `coworkerId` returns 409 `conflict`. Creates no model session; the first request does. After 503 `retry_same_request`, resend the identical body.",
+        "operationId": "openConversation",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenConversation"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The conversation exists. A new conversation has no messages.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationSnapshot"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/CommandUnavailable"
+          },
+          "503": {
+            "$ref": "#/components/responses/CommandUnavailable"
+          }
+        }
+      }
+    },
+    "/v1/conversations/{conversationId}": {
+      "get": {
+        "description": "The conversation's phase and the messages of its API requests, oldest first: each request's text and, once completed, its answer. Turns taken through the CLI or Slack are not shown. `truncated` is true when older messages were dropped to bound the response. A pure read.",
+        "operationId": "conversation",
+        "parameters": [
+          {
+            "name": "conversationId",
+            "in": "path",
+            "description": "The conversation's UUID.",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The conversation snapshot.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationSnapshot"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/conversations/{conversationId}/requests": {
+      "post": {
+        "description": "One admission attempt for the identity (`conversationId`, `requestId`). 202 means the request is durably recorded and will run after the conversation's earlier requests; it does not mean the request ran. Resending the identical text returns the current receipt and never starts a second turn; changed text returns 409 `conflict`. After a lost response or 503 `retry_same_request`, reconcile with `requestStatus` and resend the identical body.",
+        "operationId": "submit",
+        "parameters": [
+          {
+            "name": "conversationId",
+            "in": "path",
+            "description": "The conversation's UUID.",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubmitRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "The request is recorded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RequestReceipt"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/CommandUnavailable"
+          },
+          "503": {
+            "$ref": "#/components/responses/CommandUnavailable"
+          }
+        }
+      }
+    },
+    "/v1/conversations/{conversationId}/requests/{requestId}": {
+      "get": {
+        "description": "The receipt for one request, with `result.text` once it is `completed`. A pure read that never starts a turn; poll it to reconcile after any submit or cancel.",
+        "operationId": "requestStatus",
+        "parameters": [
+          {
+            "name": "conversationId",
+            "in": "path",
+            "description": "The conversation's UUID.",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            }
+          },
+          {
+            "name": "requestId",
+            "in": "path",
+            "description": "The request's UUID.",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The request's receipt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RequestReceipt"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/conversations/{conversationId}/requests/{requestId}/cancel": {
+      "post": {
+        "description": "Record cancellation intent. An `accepted` request becomes `cancelled` without running; a `running` one becomes `cancellation_requested` until its turn stops. A request that already concluded keeps its outcome, including a completed result. Repeating it returns the current receipt.",
+        "operationId": "cancel",
+        "parameters": [
+          {
+            "name": "conversationId",
+            "in": "path",
+            "description": "The conversation's UUID.",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            }
+          },
+          {
+            "name": "requestId",
+            "in": "path",
+            "description": "The request's UUID.",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CancelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "The cancellation intent is recorded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RequestReceipt"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/CommandUnavailable"
+          },
+          "503": {
+            "$ref": "#/components/responses/CommandUnavailable"
+          }
+        }
+      }
+    },
+    "/v1/coworkers": {
+      "get": {
+        "description": "Every configured coworker in configuration order, with a digest of its instructions and never their text. Coworkers come from configuration and cannot be created over HTTP. A pure read.",
+        "operationId": "listCoworkers",
+        "responses": {
+          "200": {
+            "description": "Configured coworkers.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CoworkerList"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/health": {
+      "get": {
+        "description": "Readiness of the gateway store, probed with a ping bounded to 2 seconds. Returns 200 when ready and 503 with the same body shape when not; a dependency failure is reported in the body, never as an error code. A pure read.",
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "Ready.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "503": {
+            "description": "Not ready.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CancelRequest": {
+        "type": "object",
+        "description": "Must be exactly `{}`.",
+        "additionalProperties": false
+      },
+      "Capabilities": {
+        "type": "object",
+        "description": "Contract identifiers and configured limits. Reject an unsupported `apiVersion` or `requestContract`.",
+        "required": [
+          "apiVersion",
+          "requestContract",
+          "backend",
+          "limits",
+          "statuses",
+          "reasons"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string",
+            "enum": [
+              "1"
+            ]
+          },
+          "requestContract": {
+            "type": "string",
+            "enum": [
+              "sqlite-outbox-keyed-admission-v1"
+            ]
+          },
+          "backend": {
+            "type": "string",
+            "enum": [
+              "local",
+              "borb"
+            ]
+          },
+          "limits": {
+            "type": "object",
+            "required": [
+              "maxPromptBytes",
+              "maxQueuedPerConversation",
+              "modelTurnSeconds",
+              "maxPageSize"
+            ],
+            "properties": {
+              "maxPromptBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "maxQueuedPerConversation": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "modelTurnSeconds": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "maxPageSize": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          "statuses": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RequestStatus"
+            }
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FailureReason"
+            }
+          }
+        }
+      },
+      "ConversationPage": {
+        "type": "object",
+        "required": [
+          "apiVersion",
+          "conversations",
+          "next"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string",
+            "enum": [
+              "1"
+            ]
+          },
+          "conversations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConversationState"
+            }
+          },
+          "next": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Opaque cursor for the next page, or `null` on the last page."
+          }
+        }
+      },
+      "ConversationSnapshot": {
+        "type": "object",
+        "description": "Messages from this conversation's API requests only, oldest first.",
+        "required": [
+          "apiVersion",
+          "state",
+          "messages",
+          "truncated"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string",
+            "enum": [
+              "1"
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/ConversationState"
+          },
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SnapshotMessage"
+            }
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "Whether older messages were dropped to bound the response."
+          }
+        }
+      },
+      "ConversationState": {
+        "type": "object",
+        "description": "`phase` is `running` while any request in the conversation is `accepted`, `running`, or `cancellation_requested`.",
+        "required": [
+          "conversationId",
+          "coworkerId",
+          "phase"
+        ],
+        "properties": {
+          "conversationId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "coworkerId": {
+            "type": "string",
+            "maxLength": 64,
+            "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+          },
+          "phase": {
+            "type": "string",
+            "enum": [
+              "idle",
+              "running"
+            ]
+          }
+        }
+      },
+      "Coworker": {
+        "type": "object",
+        "description": "A configured coworker. Never carries instruction text or Slack identifiers.",
+        "required": [
+          "coworkerId",
+          "name",
+          "role",
+          "workspace",
+          "slack",
+          "instructions"
+        ],
+        "properties": {
+          "coworkerId": {
+            "type": "string",
+            "maxLength": 64,
+            "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+          },
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          },
+          "workspace": {
+            "type": "string",
+            "enum": [
+              "disabled",
+              "read_only",
+              "read_write"
+            ]
+          },
+          "slack": {
+            "type": "boolean",
+            "description": "Whether this coworker also answers Slack mentions."
+          },
+          "instructions": {
+            "type": "object",
+            "required": [
+              "bytes",
+              "digest"
+            ],
+            "properties": {
+              "bytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "digest": {
+                "type": "string",
+                "description": "Lowercase hex SHA-256 of the configured instructions.",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            }
+          }
+        }
+      },
+      "CoworkerList": {
+        "type": "object",
+        "required": [
+          "apiVersion",
+          "coworkers"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string",
+            "enum": [
+              "1"
+            ]
+          },
+          "coworkers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Coworker"
+            },
+            "description": "Every configured coworker, in configuration order."
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "description": "The only error body.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorCode"
+          }
+        }
+      },
+      "ErrorCode": {
+        "type": "string",
+        "description": "A fixed public error code. No error body carries any other detail.",
+        "enum": [
+          "invalid_json",
+          "invalid_input",
+          "unauthorized",
+          "not_found",
+          "method_not_allowed",
+          "conflict",
+          "queue_full",
+          "payload_too_large",
+          "internal",
+          "retry_same_request",
+          "unavailable"
+        ]
+      },
+      "FailureReason": {
+        "type": "string",
+        "description": "Why a request ended `failed` or `uncertain`.",
+        "enum": [
+          "conversation_busy",
+          "timeout",
+          "interrupted",
+          "workspace_unavailable",
+          "store_unavailable",
+          "agent_unavailable",
+          "cleanup_failed",
+          "model_failed",
+          "no_answer",
+          "invalid_request",
+          "configuration_changed",
+          "coworker_removed",
+          "process_stopped"
+        ]
+      },
+      "Health": {
+        "type": "object",
+        "description": "The same body is returned with `200` when ready and `503` when not.",
+        "required": [
+          "apiVersion",
+          "status",
+          "dependencies",
+          "outstandingAdmissions"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string",
+            "enum": [
+              "1"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "ready",
+              "not_ready"
+            ]
+          },
+          "dependencies": {
+            "type": "object",
+            "required": [
+              "database"
+            ],
+            "properties": {
+              "database": {
+                "type": "object",
+                "required": [
+                  "status"
+                ],
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "ready",
+                      "unavailable"
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "outstandingAdmissions": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Turns whose admission crabber has not answered after this process stopped waiting. Each holds one of `limits.max_concurrent_turns`, shared with Slack, until crabber answers. It does not affect `status`.",
+            "minimum": 0
+          }
+        }
+      },
+      "OpenConversation": {
+        "type": "object",
+        "required": [
+          "conversationId",
+          "coworkerId"
+        ],
+        "properties": {
+          "conversationId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "coworkerId": {
+            "type": "string",
+            "maxLength": 64,
+            "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "RequestReceipt": {
+        "type": "object",
+        "description": "`result` appears only when `status` is `completed`, `reason` only when it is `failed` or `uncertain`, and `cancellation` once cancellation has been requested.",
+        "required": [
+          "apiVersion",
+          "conversationId",
+          "requestId",
+          "acceptance",
+          "status"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string",
+            "enum": [
+              "1"
+            ]
+          },
+          "conversationId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "requestId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "acceptance": {
+            "type": "object",
+            "required": [
+              "boundary"
+            ],
+            "properties": {
+              "boundary": {
+                "type": "string",
+                "enum": [
+                  "sqlite_outbox"
+                ]
+              }
+            }
+          },
+          "status": {
+            "$ref": "#/components/schemas/RequestStatus"
+          },
+          "result": {
+            "type": "object",
+            "required": [
+              "text"
+            ],
+            "properties": {
+              "text": {
+                "type": "string"
+              }
+            }
+          },
+          "reason": {
+            "$ref": "#/components/schemas/FailureReason"
+          },
+          "cancellation": {
+            "type": "object",
+            "required": [
+              "requestedAt"
+            ],
+            "properties": {
+              "requestedAt": {
+                "type": "string",
+                "format": "date-time",
+                "description": "RFC 3339 UTC time the cancellation was first recorded."
+              }
+            }
+          }
+        }
+      },
+      "RequestStatus": {
+        "type": "string",
+        "description": "Lifecycle of a submitted request.",
+        "enum": [
+          "accepted",
+          "running",
+          "completed",
+          "cancellation_requested",
+          "cancelled",
+          "failed",
+          "uncertain"
+        ]
+      },
+      "SnapshotMessage": {
+        "type": "object",
+        "required": [
+          "requestId",
+          "role",
+          "text"
+        ],
+        "properties": {
+          "requestId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "user",
+              "assistant"
+            ]
+          },
+          "text": {
+            "type": "string",
+            "description": "The submitted text for `user`, the committed `result.text` for `assistant`."
+          }
+        }
+      },
+      "SubmitRequest": {
+        "type": "object",
+        "required": [
+          "requestId",
+          "text"
+        ],
+        "properties": {
+          "requestId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "text": {
+            "type": "string",
+            "description": "Exact UTF-8 input, compared byte for byte on resubmission. Must contain a non-whitespace character and no NUL. The configured `limits.max_prompt_bytes`, reported by `GET /v1/capabilities`, applies; `x-maxUtf8Bytes` is the hard ceiling.",
+            "minLength": 1,
+            "x-maxUtf8Bytes": 1048576
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "responses": {
+      "CommandUnavailable": {
+        "description": "The command's outcome is unknown. Reconcile with a read of the same identity, then resend the identical request.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Error": {
+        "description": "A fixed public error code.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unavailable": {
+        "description": "The read could not be completed. Repeating it is safe.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    }
+  },
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ]
+}
