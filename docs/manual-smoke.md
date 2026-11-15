@@ -103,3 +103,59 @@ provider errors.
 
 | Date | Commit SHA | Crabber rev | Worker image digest | Step | Outcome flags |
 | --- | --- | --- | --- | --- | --- |
+
+## HTTP API live check
+
+This check uses the real model and needs `OPENCODE_GO_API_KEY`. The credential-free tests prove the routes, replay, restart, and crash settlement against a scripted provider. Only a live run proves the path through the hosted model. The check runs outside `cargo xtask check`.
+
+Use a configuration whose only frontend is the API. Copy `config.example.json` to `config.json` and remove Scout's `slack` block. The `api` block listens on `127.0.0.1:8787`.
+
+1. Generate the token into the environment without printing it. Start `serve` in the background of the same shell, so that the later commands share the token. Confirm stderr `API listening on 127.0.0.1:8787`.
+
+```sh
+export CRABBER_COWORKERS_API_TOKEN="$(openssl rand -hex 32)"
+target/release/crabber-coworkers serve --config config.json &
+```
+
+2. Open a conversation and submit a request. Confirm `201` for the open and `202` with status `accepted` for the submission.
+
+```sh
+api=http://127.0.0.1:8787/v1
+auth="Authorization: Bearer $CRABBER_COWORKERS_API_TOKEN"
+json='Content-Type: application/json'
+conversation=$(uuidgen | tr 'A-F' 'a-f')
+request=$(uuidgen | tr 'A-F' 'a-f')
+curl -sS -o /dev/null -w '%{http_code}\n' -H "$auth" -H "$json" -d "{\"conversationId\":\"$conversation\",\"coworkerId\":\"scout\"}" "$api/conversations"
+curl -sS -H "$auth" -H "$json" -d "{\"requestId\":\"$request\",\"text\":\"<prompt>\"}" "$api/conversations/$conversation/requests"
+```
+
+3. Poll the receipt until its status is `completed`.
+
+```sh
+curl -sS -H "$auth" "$api/conversations/$conversation/requests/$request"
+```
+
+4. Resend the submission from step 2 unchanged. Confirm `202` and the same `completed` receipt.
+5. Submit a long prompt under a new `requestId`. While its status is `running`, stop `serve` with `kill -TERM %1`. Confirm stderr `stopped` and exit code 0. Start `serve` again and read the receipt. Expect `failed` with reason `interrupted`. If the request completed, repeat the step with a longer prompt.
+6. Optionally check crash settlement. Submit another long prompt under a new `requestId`. While its status is `running`, stop `serve` with `kill -KILL %1`, and start it again. Poll the receipt for up to 60 seconds. Expect `uncertain` with reason `process_stopped`. If the kill came before the turn started, the request runs again and ends `completed`. Then submit a short request in the same conversation and confirm that it completes.
+
+Record the commit, the commands, the HTTP status codes, and each receipt's `status` and `reason`. Never record the token, the prompt text, or `result.text`.
+
+| Date | Commit SHA | Crabber rev | Step | Observed result |
+| --- | --- | --- | --- | --- |
+| 2026-11-15 | `9c46c79cc9a113667940fa1c3b4e6ab205c43682` | `a32b1a83bce10649b56498d7967ab3383490aa51` | Steps 1 to 6 | Not run. No `OPENCODE_GO_API_KEY` was available. The live model path is unverified. |
+| 2026-11-15 | `9c46c79cc9a113667940fa1c3b4e6ab205c43682` | `a32b1a83bce10649b56498d7967ab3383490aa51` | Credential-free loopback check | Passed. The observed results are listed below. |
+
+The credential-free loopback check ran the release binary against a temporary `state_dir` on a free loopback port, with a token from `openssl rand -hex 32` that was never printed. `OPENCODE_GO_API_KEY` held a placeholder so that `serve` would start. No request was accepted, so no model call was made. It observed:
+
+- Each startup refusal exited 2 with its fixed message. The refusals were a missing token, a short token, a token with a space, a non-loopback `api.listen`, and a configuration with no frontend. After the missing token and the short token, `state_dir` did not exist.
+- `serve` logs `API listening on 127.0.0.1:<port>`.
+- Without the token, a documented route, an unknown path, a wrong method, and an invalid body each return `401 unauthorized` with `WWW-Authenticate: Bearer` and no `Allow` header. A wrong token returns the same response.
+- `health` returns `200` with `ready` and `outstandingAdmissions` 0. `capabilities` returns `200` with backend `local`. `listCoworkers` returns `200`.
+- `openConversation` returns `201` with an empty snapshot, `201` again on repeat, `409 conflict` for another coworker, `404 not_found` for an unknown coworker, `400 invalid_input` for an uppercase UUID or an unknown field, and `400 invalid_json` for malformed JSON.
+- `listConversations` and `conversation` return `200`. An unknown request returns `404 not_found` for status and cancel. A query parameter on `health`, `limit=0`, and a blank `text` each return `400 invalid_input`.
+- A wrong method returns `405 method_not_allowed` with `Allow` set to `GET`, `POST`, or `GET,POST`. `HEAD` returns `405`. `POST /v1/conversations/{conversationId}/events` returns `404 not_found`.
+- The state directory has mode `0700`. `api.sqlite` and `api.lock` have mode `0600`.
+- A second `serve` on the same `state_dir` exits 1 with `API store is in use`.
+- SIGTERM and SIGINT each log `stopped` and exit 0. The conversation is still present after a restart.
+- The token appears in neither the stderr output nor the state files.
