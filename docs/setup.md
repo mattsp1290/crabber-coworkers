@@ -181,7 +181,7 @@ SIGINT, SIGTERM, or SIGHUP stops intake, drops queued mentions, interrupts activ
 | `coworkers[i].slack.allowed_channel_ids must contain 1–64 unique Slack channel IDs` | 2 |
 | `coworkers[i].slack.allowed_user_ids must contain 1–256 unique Slack user IDs` | 2 |
 | `limits.max_concurrent_turns must be in 1..=32` | 2 |
-| `no coworker has a slack block` | 2 |
+| `nothing to serve; add a slack block or an api block` | 2 |
 | `<VAR> is not set` | 2 |
 | `<VAR> has the wrong token type` | 2 |
 | `Slack authentication failed for <id>` | 1 |
@@ -193,7 +193,7 @@ SIGINT, SIGTERM, or SIGHUP stops intake, drops queued mentions, interrupts activ
 | `Slack delivery failed for <id>` | stderr log |
 | `Slack event ignored for <id>` | stderr log |
 | `Slack worker failed` | stderr log; worker task ended unexpectedly |
-| `Slack shutdown timed out` | stderr log; remaining tasks aborted |
+| `serve shutdown timed out` | stderr log; remaining tasks aborted |
 
 The transport's library errors are fixed categories: `Slack authentication failed`, `Slack rate limited`, `Slack request failed`, `Slack rejected the request`, and `Slack disabled the Socket Mode link`. The daemon maps them to the coworker-specific messages above. Slack notices are listed in [Slack setup](slack-setup.md).
 

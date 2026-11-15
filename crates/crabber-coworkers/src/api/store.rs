@@ -480,7 +480,7 @@ impl Faults {
 pub struct ApiStore {
     pool: SqlitePool,
     options: SqliteConnectOptions,
-    _lock: Arc<File>,
+    lock: Arc<File>,
     faults: Option<Arc<Faults>>,
 }
 
@@ -529,9 +529,16 @@ impl ApiStore {
         Ok(Self {
             pool,
             options,
-            _lock: Arc::new(lock),
+            lock: Arc::new(lock),
             faults: None,
         })
+    }
+
+    /// Hold `api.lock` until the process exits, even after every clone drops. For a process that
+    /// abandons admissions crabber may still be preparing: no other process may take the store
+    /// and reconcile those requests while this one lives.
+    pub fn keep_lock_until_exit(&self) {
+        std::mem::forget(Arc::clone(&self.lock));
     }
 
     #[doc(hidden)]
@@ -1109,7 +1116,9 @@ async fn migrate(options: &SqliteConnectOptions) -> Result<(), StoreFault> {
     }
     if version == 0 {
         let mut tx = connection.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::raw_sql(SCHEMA).execute(&mut *tx).await?;
+        // The executor's boxed future, unlike `RawSql::execute`'s, is provably `Send` where
+        // `serve` spawns it.
+        sqlx::Executor::execute(&mut *tx, sqlx::raw_sql(SCHEMA)).await?;
         tx.commit().await?;
     }
     connection.close().await?;

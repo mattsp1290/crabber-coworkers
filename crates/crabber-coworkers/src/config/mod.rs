@@ -1,15 +1,17 @@
 pub mod constants;
 use constants::{
-    DEFAULT_CONCURRENT_TURNS, DEFAULT_PROMPT_BYTES, DEFAULT_TURN_SECONDS, MAX_ALLOWED_CHANNELS,
-    MAX_ALLOWED_USERS, MAX_CONCURRENT_TURNS, MAX_CONFIG_BYTES, MAX_COWORKERS, MAX_ID_BYTES,
-    MAX_INSTRUCTIONS_BYTES, MAX_NAME_BYTES, MAX_PROMPT_BYTES, MAX_ROLE_BYTES, MAX_SLACK_ID_BYTES,
-    MAX_STATE_DIR_BYTES, MAX_TURN_SECONDS,
+    DEFAULT_API_LISTEN, DEFAULT_CONCURRENT_TURNS, DEFAULT_PROMPT_BYTES,
+    DEFAULT_QUEUED_PER_CONVERSATION, DEFAULT_TURN_SECONDS, MAX_ALLOWED_CHANNELS, MAX_ALLOWED_USERS,
+    MAX_CONCURRENT_TURNS, MAX_CONFIG_BYTES, MAX_COWORKERS, MAX_ID_BYTES, MAX_INSTRUCTIONS_BYTES,
+    MAX_NAME_BYTES, MAX_PROMPT_BYTES, MAX_QUEUED_PER_CONVERSATION, MAX_ROLE_BYTES,
+    MAX_SLACK_ID_BYTES, MAX_STATE_DIR_BYTES, MAX_TURN_SECONDS,
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     fs::File,
     io::Read,
+    net::SocketAddr,
     path::{Path, PathBuf},
 };
 
@@ -22,6 +24,53 @@ pub struct Config {
     pub limits: Limits,
     #[serde(default)]
     pub borb: Option<BorbConfig>,
+    /// Serve the HTTP API. Its presence enables the API; there is no separate switch.
+    #[serde(default)]
+    pub api: Option<ApiConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ApiConfig {
+    pub listen: String,
+    pub max_queued_per_conversation: usize,
+    /// States that the operator means to expose the API beyond this host.
+    pub allow_remote: bool,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            listen: DEFAULT_API_LISTEN.into(),
+            max_queued_per_conversation: DEFAULT_QUEUED_PER_CONVERSATION,
+            allow_remote: false,
+        }
+    }
+}
+
+impl ApiConfig {
+    /// The listen address, or `None` when `listen` is not a socket address.
+    #[must_use]
+    pub fn listen_addr(&self) -> Option<SocketAddr> {
+        self.listen.parse().ok()
+    }
+
+    fn validate(&self, errors: &mut Vec<String>) {
+        match self.listen_addr() {
+            None => errors.push("api.listen must be a socket address".into()),
+            Some(addr) if !self.allow_remote && !addr.ip().to_canonical().is_loopback() => {
+                errors.push(
+                    "api.listen must be a loopback address unless api.allow_remote is true".into(),
+                );
+            }
+            Some(_) => {}
+        }
+        if !(1..=MAX_QUEUED_PER_CONVERSATION).contains(&self.max_queued_per_conversation) {
+            errors.push(format!(
+                "api.max_queued_per_conversation must be in 1..={MAX_QUEUED_PER_CONVERSATION}"
+            ));
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +168,24 @@ impl Default for Limits {
             max_prompt_bytes: DEFAULT_PROMPT_BYTES,
             model_turn_seconds: DEFAULT_TURN_SECONDS,
             max_concurrent_turns: DEFAULT_CONCURRENT_TURNS,
+        }
+    }
+}
+
+impl Limits {
+    fn validate(&self, errors: &mut Vec<String>) {
+        if !(1..=MAX_CONCURRENT_TURNS).contains(&self.max_concurrent_turns) {
+            errors.push("limits.max_concurrent_turns must be in 1..=32".into());
+        }
+        if !(1..=MAX_PROMPT_BYTES).contains(&self.max_prompt_bytes) {
+            errors.push(format!(
+                "limits.max_prompt_bytes must be in 1..={MAX_PROMPT_BYTES}"
+            ));
+        }
+        if !(1..=MAX_TURN_SECONDS).contains(&self.model_turn_seconds) {
+            errors.push(format!(
+                "limits.model_turn_seconds must be in 1..={MAX_TURN_SECONDS}"
+            ));
         }
     }
 }
@@ -222,18 +289,9 @@ impl Config {
                 }
             }
         }
-        if !(1..=MAX_CONCURRENT_TURNS).contains(&self.limits.max_concurrent_turns) {
-            errors.push("limits.max_concurrent_turns must be in 1..=32".into());
-        }
-        if !(1..=MAX_PROMPT_BYTES).contains(&self.limits.max_prompt_bytes) {
-            errors.push(format!(
-                "limits.max_prompt_bytes must be in 1..={MAX_PROMPT_BYTES}"
-            ));
-        }
-        if !(1..=MAX_TURN_SECONDS).contains(&self.limits.model_turn_seconds) {
-            errors.push(format!(
-                "limits.model_turn_seconds must be in 1..={MAX_TURN_SECONDS}"
-            ));
+        self.limits.validate(&mut errors);
+        if let Some(api) = &self.api {
+            api.validate(&mut errors);
         }
         if errors.is_empty() {
             Ok(())
@@ -433,6 +491,72 @@ mod tests {
                 "limits.max_concurrent_turns must be in 1..=32"
             );
         }
+    }
+
+    #[test]
+    fn api_block_defaults() {
+        let mut v = example();
+        assert_eq!(parse(&v).unwrap().api.unwrap().listen, "127.0.0.1:8787");
+        v.as_object_mut().unwrap().remove("api");
+        assert!(parse(&v).unwrap().api.is_none());
+        v["api"] = json!({});
+        let api = parse(&v).unwrap().api.unwrap();
+        assert_eq!(api.listen, "127.0.0.1:8787");
+        assert_eq!(api.max_queued_per_conversation, 16);
+        assert!(!api.allow_remote);
+        assert_eq!(api.listen_addr(), Some("127.0.0.1:8787".parse().unwrap()));
+    }
+
+    #[test]
+    fn api_block_validation() {
+        for (api, message) in [
+            (
+                json!({"listen":"localhost:8787"}),
+                "api.listen must be a socket address",
+            ),
+            (
+                json!({"listen":"127.0.0.1"}),
+                "api.listen must be a socket address",
+            ),
+            (
+                json!({"listen":"0.0.0.0:8787"}),
+                "api.listen must be a loopback address unless api.allow_remote is true",
+            ),
+            (
+                json!({"listen":"[::ffff:10.0.0.1]:8787"}),
+                "api.listen must be a loopback address unless api.allow_remote is true",
+            ),
+            (
+                json!({"max_queued_per_conversation":0}),
+                "api.max_queued_per_conversation must be in 1..=256",
+            ),
+            (
+                json!({"max_queued_per_conversation":257}),
+                "api.max_queued_per_conversation must be in 1..=256",
+            ),
+        ] {
+            let mut v = example();
+            v["api"] = api.clone();
+            assert_eq!(parse(&v).unwrap_err().to_string(), message, "{api}");
+        }
+        for api in [
+            json!({"listen":"[::1]:0", "max_queued_per_conversation":256}),
+            json!({"listen":"[::ffff:127.0.0.1]:8787", "max_queued_per_conversation":1}),
+            json!({"listen":"0.0.0.0:8787", "allow_remote":true}),
+        ] {
+            let mut v = example();
+            v["api"] = api.clone();
+            assert!(parse(&v).is_ok(), "{api}");
+        }
+    }
+
+    #[test]
+    fn api_unknown_key() {
+        let mut v = example();
+        v["api"] = json!({"secret-marker":true});
+        let e = parse(&v).unwrap_err().to_string();
+        assert!(e.ends_with("(data)"));
+        assert!(!e.contains("secret-marker"));
     }
 
     #[test]

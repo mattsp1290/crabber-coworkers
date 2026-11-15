@@ -2,8 +2,10 @@ use axum::{
     body::Body,
     http::{Method, Request, StatusCode},
 };
+use crabber::{FakeProvider, Selection};
 use crabber_coworkers::{
     api::{
+        auth::ApiTokenSource,
         contract::{
             Acceptance, ApiUuid, ApiVersion, BackendKind, CancelRequest, Cancellation,
             Capabilities, CapabilityLimits, ConversationPage, ConversationPhase,
@@ -13,13 +15,17 @@ use crabber_coworkers::{
             RequestContract, RequestReceipt, RequestResult, RequestStatus, SnapshotMessage,
             SubmitRequest, WorkspaceAccess, decode_body,
         },
+        dispatch::{Dispatcher, Wiring},
         openapi::document_json,
-        routes,
+        routes::{self, ApiState},
+        store::ApiStore,
     },
-    config::constants::MAX_PROMPT_BYTES,
+    config::{self, constants::MAX_PROMPT_BYTES},
+    turn::{Backend, TurnPermits},
 };
 use serde_json::{Value, json};
-use std::process::Command;
+use std::{collections::HashMap, path::Path, process::Command, sync::Arc};
+use tokio::sync::{mpsc, watch};
 use tower::ServiceExt;
 
 const OPERATIONS: [(&str, &str, &str); 9] = [
@@ -65,6 +71,7 @@ const COMPONENTS: [&str; 16] = [
     "Health",
 ];
 const ID: &str = "0b5e8f1c-3d2a-4e6f-9a7b-1c2d3e4f5a6b";
+const TOKEN: &str = "openapi-route-parity-token-0123456789";
 
 fn document() -> Value {
     serde_json::from_str(&document_json()).unwrap()
@@ -373,6 +380,7 @@ fn service_bodies_match_their_schemas() {
                 dependencies: HealthDependencies {
                     database: DependencyHealth { status: database },
                 },
+                outstanding_admissions: 0,
             },
         );
     }
@@ -454,8 +462,68 @@ fn request_schemas_agree_with_decoding() {
     assert!(!decodes(&body)[2]);
 }
 
+/// The router `serve` builds, over a fresh gateway store that holds conversation and request
+/// `ID`, so that every documented operation finds what its path names. The sender keeps the
+/// dispatcher running.
+async fn router(directory: &Path) -> (axum::Router, watch::Sender<bool>) {
+    let mut config =
+        config::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.example.json"))
+            .unwrap();
+    config.state_dir = directory.to_path_buf();
+    let config = Arc::new(config);
+    let store = ApiStore::open(directory).await.unwrap();
+    let id = ApiUuid::parse(ID).unwrap();
+    store
+        .open_conversation(id, &CoworkerId::parse("scout").unwrap())
+        .await
+        .unwrap();
+    store.submit(id, id, "question", 16).await.unwrap();
+    let backend = Arc::new(Backend::Local {
+        resolver: Arc::new(FakeProvider::scripted(vec![])),
+        selection: Selection {
+            provider_id: "fake".into(),
+            model_id: "scripted".into(),
+        },
+    });
+    let (stop, stopped) = watch::channel(false);
+    let (log, _) = mpsc::unbounded_channel();
+    let dispatcher = Dispatcher::new(Wiring {
+        store: store.clone(),
+        backend: backend.clone(),
+        permits: TurnPermits::new(1),
+        config: config.clone(),
+        locals: HashMap::new(),
+        stop: stopped.clone(),
+        intake: stopped.clone(),
+        log,
+    });
+    let token = ApiTokenSource::Fixed(TOKEN.into()).resolve().unwrap();
+    let state = ApiState::new(token, config, &backend, store, dispatcher, stopped);
+    (routes::router(state), stop)
+}
+
+async fn status_of(
+    router: &axum::Router,
+    method: Method,
+    uri: &str,
+    token: Option<&str>,
+) -> StatusCode {
+    let mut request = Request::builder().method(method).uri(uri);
+    if let Some(token) = token {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    router
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
 #[tokio::test]
 async fn router_serves_exactly_the_documented_operations() {
+    let directory = tempfile::tempdir().unwrap();
+    let (router, _running) = router(directory.path()).await;
     let document = document();
     let paths = document["paths"].as_object().unwrap();
     assert_eq!(paths.len(), 8);
@@ -472,22 +540,17 @@ async fn router_serves_exactly_the_documented_operations() {
             Method::DELETE,
         ] {
             let documented = item.get(method.as_str().to_lowercase()).is_some();
-            let status = routes::router()
-                .oneshot(
-                    Request::builder()
-                        .method(method.clone())
-                        .uri(&uri)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-                .status();
+            let status = status_of(&router, method.clone(), &uri, Some(TOKEN)).await;
             assert_ne!(status, StatusCode::NOT_FOUND, "{method} {uri}");
             assert_eq!(
                 status == StatusCode::METHOD_NOT_ALLOWED,
                 !documented,
                 "{method} {uri}: {status}"
+            );
+            assert_eq!(
+                status_of(&router, method.clone(), &uri, None).await,
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri}"
             );
         }
     }
@@ -496,11 +559,16 @@ async fn router_serves_exactly_the_documented_operations() {
         "/healthz",
         "/v1/conversations/0b5e8f1c-3d2a-4e6f-9a7b-1c2d3e4f5a6b/events",
     ] {
-        let response = routes::router()
-            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(
+            status_of(&router, Method::GET, path, Some(TOKEN)).await,
+            StatusCode::NOT_FOUND,
+            "{path}"
+        );
+        assert_eq!(
+            status_of(&router, Method::GET, path, None).await,
+            StatusCode::UNAUTHORIZED,
+            "{path}"
+        );
     }
 }
 

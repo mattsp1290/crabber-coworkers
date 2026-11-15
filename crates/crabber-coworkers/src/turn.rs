@@ -120,6 +120,15 @@ impl LocalState {
     }
 }
 
+/// The coworkers a process runs turns for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Served {
+    /// Only coworkers with a `slack` block.
+    Slack,
+    /// Every configured coworker, as the HTTP API serves them all.
+    Every,
+}
+
 /// Open the local state of every configured coworker, keyed by coworker ID. A borb backend keeps
 /// conversations in its workers, so it opens nothing.
 ///
@@ -130,9 +139,25 @@ pub async fn open_all(
     backend: &Backend,
     stop: &mut Cancel,
 ) -> Result<HashMap<String, Arc<LocalState>>, LocalError> {
+    open_served(config, backend, Served::Every, stop).await
+}
+
+/// Open the local state of the coworkers in `served`, as [`open_all`] does for all of them.
+///
+/// # Errors
+/// Fails on the first coworker whose workspace or store cannot be opened, or when `stop` fires.
+pub async fn open_served(
+    config: &Config,
+    backend: &Backend,
+    served: Served,
+    stop: &mut Cancel,
+) -> Result<HashMap<String, Arc<LocalState>>, LocalError> {
     let mut locals = HashMap::new();
     if matches!(backend, Backend::Local { .. }) {
         for (index, def) in config.coworkers.iter().enumerate() {
+            if served == Served::Slack && def.slack.is_none() {
+                continue;
+            }
             let local = LocalState::open(config, index, stop).await?;
             locals.insert(def.id.clone(), Arc::new(local));
         }

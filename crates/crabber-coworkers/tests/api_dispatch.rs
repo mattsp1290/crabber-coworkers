@@ -206,7 +206,8 @@ impl Gateway {
             permits: permits.clone(),
             config: Arc::new(config),
             locals,
-            stop: stopped,
+            stop: stopped.clone(),
+            intake: stopped,
             log,
         });
         Self {
@@ -704,7 +705,7 @@ async fn a_stop_before_admission_leaves_the_request_for_the_next_process() {
     let gateway = Gateway::serving(directory.path(), provider.clone()).await;
     assert_eq!(
         gateway.state(CONVERSATION, REQUEST).await,
-        RequestState::Running
+        RequestState::Accepted
     );
     gateway.dispatcher.wake_pending().await.unwrap();
     assert_eq!(

@@ -315,6 +315,7 @@ fn validate(worker: &Worker, request: &TurnRequest) -> Result<tokio::time::Insta
             max_concurrent_turns: MAX_ACTIVE,
         },
         borb: None,
+        api: None,
     }
     .validate()
     .map_err(|_| StatusCode::BAD_REQUEST)?;

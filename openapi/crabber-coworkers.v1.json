@@ -836,7 +836,8 @@
         "required": [
           "apiVersion",
           "status",
-          "dependencies"
+          "dependencies",
+          "outstandingAdmissions"
         ],
         "properties": {
           "apiVersion": {
@@ -874,6 +875,12 @@
                 }
               }
             }
+          },
+          "outstandingAdmissions": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Turns whose admission crabber has not answered after this process stopped waiting. Each holds one of `limits.max_concurrent_turns`, shared with Slack, until crabber answers. It does not affect `status`.",
+            "minimum": 0
           }
         }
       },

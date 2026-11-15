@@ -571,6 +571,8 @@ pub struct Health {
     pub status: HealthStatus,
     #[schema(inline)]
     pub dependencies: HealthDependencies,
+    /// Turns whose admission crabber has not answered after this process stopped waiting. Each holds one of `limits.max_concurrent_turns`, shared with Slack, until crabber answers. It does not affect `status`.
+    pub outstanding_admissions: u64,
 }
 
 #[cfg(test)]

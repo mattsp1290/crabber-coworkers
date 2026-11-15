@@ -77,8 +77,13 @@ pub struct Wiring {
     pub config: Arc<Config>,
     /// Local state by coworker ID, from [`crate::turn::open_all`].
     pub locals: HashMap<String, Arc<LocalState>>,
-    /// Becomes `true` when the service stops.
+    /// Becomes `true` when the service stops. Running turns are interrupted.
     pub stop: watch::Receiver<bool>,
+    /// Becomes `true` when the service stops taking work, before or without a stop. Turns that
+    /// are running finish, and no request starts after it: a conversation task exits instead of
+    /// reading its next head, a request still waiting for a turn stays `accepted` for the next
+    /// process, and a wake starts nothing. A stop implies it.
+    pub intake: watch::Receiver<bool>,
     /// Receives fixed operator log lines.
     pub log: mpsc::UnboundedSender<String>,
 }
@@ -125,7 +130,7 @@ enum Step {
     Next,
     /// Leave the head as it is and exit, unless a wake is already pending.
     Park,
-    /// The service is stopping: exit.
+    /// The service is stopping, or its intake closed: exit and leave the head as it is.
     Stop,
 }
 
@@ -377,10 +382,10 @@ impl Dispatcher {
     }
 
     /// Make sure the conversation's requests get run: start its task, or tell the live one to
-    /// read its head again. Call it after every committed submission. A stopping service starts
-    /// nothing.
+    /// read its head again. Call it after every committed submission. Once intake has closed it
+    /// starts nothing.
     pub fn wake(&self, conversation_id: ApiUuid) {
-        if self.0.stopped() {
+        if self.0.closed() {
             return;
         }
         match self.0.conversations().entry(conversation_id) {
@@ -446,9 +451,9 @@ impl Dispatcher {
         Ok(row)
     }
 
-    /// Wait until no conversation task is left, and no task keeping an admission alive. After
-    /// the stop signal the conversation tasks end once every running turn has been interrupted
-    /// and settled. A task keeping an admission alive ends only when crabber answers, which
+    /// Wait until no conversation task is left, and no task keeping an admission alive. Once
+    /// intake closes the conversation tasks end as their running turns settle, and after the
+    /// stop signal once every running turn has been interrupted and settled. A task keeping an admission alive ends only when crabber answers, which
     /// may be never, so a caller that stops the service bounds this wait by its stop budget.
     /// Dropping this future aborts the tasks it was waiting for.
     pub async fn join(&self) {
@@ -461,6 +466,13 @@ impl Dispatcher {
         }
     }
 
+    /// Admissions this process stopped waiting for that crabber has not answered yet. Each holds
+    /// a turn permit, and an aborted one stays counted.
+    #[must_use]
+    pub fn outstanding_admissions(&self) -> usize {
+        self.0.outstanding().len()
+    }
+
     /// Abort every conversation task, and every task keeping an outstanding admission alive,
     /// without settling anything. An aborted admission is no longer waited for, a run it
     /// starts late is not interrupted, and its task's hold on the gateway store's lock ends, so
@@ -468,6 +480,29 @@ impl Dispatcher {
     /// [`Self::join`] is waiting for are aborted by dropping that wait, not by this.
     pub fn abort(&self) {
         self.0.tasks().abort_all();
+    }
+}
+
+#[cfg(test)]
+impl Dispatcher {
+    /// Leave `row`'s admission outstanding behind a wait that never ends, as a turn leaves an
+    /// admission it gave up that crabber never answers. `row` must be `running` on a coworker
+    /// this dispatcher runs locally.
+    pub(crate) async fn strand(&self, row: &RequestRow) {
+        let inner = &self.0;
+        let conversation = inner.wiring.store.conversation(row.conversation_id()).await;
+        let coworker = conversation.unwrap().unwrap().coworker_id;
+        let Runner::Ready(Engine::Local(local)) = inner.runner(&coworker) else {
+            panic!("the request's coworker runs locally");
+        };
+        let name = row.conversation_id().to_string();
+        let admission = Outstanding::asked(
+            &local.request(row, &name),
+            std::future::pending(),
+            AskError::Interrupted,
+        );
+        let turn = inner.wiring.permits.acquire().await;
+        inner.outlive(row, admission, turn);
     }
 }
 
@@ -499,6 +534,20 @@ impl Inner {
 
     async fn stop(&self) {
         stop_signal(self.wiring.stop.clone()).await;
+    }
+
+    /// Whether intake has closed: no request may start.
+    fn closed(&self) -> bool {
+        self.stopped() || *self.wiring.intake.borrow()
+    }
+
+    /// Resolves once intake closes. Only for waits before a request starts, or between
+    /// requests, where giving up leaves the request as it is.
+    async fn closing(&self) {
+        tokio::select! {
+            () = stop_signal(self.wiring.stop.clone()) => {},
+            () = stop_signal(self.wiring.intake.clone()) => {},
+        }
     }
 
     /// `work`, given up when the service stops. Only for work that leaves its request safe for
@@ -568,7 +617,7 @@ impl Inner {
         };
         let runner = self.runner(&coworker);
         let mut requeues = Requeues::default();
-        while !self.stopped() {
+        while !self.closed() {
             seat.observe();
             let step = match store.next_work(conversation_id).await {
                 Ok(Some(head)) => self.head(&runner, head, &mut requeues).await,
@@ -686,10 +735,10 @@ impl Inner {
         };
         // The permit comes before the request is marked `running`, so `running` means its
         // backend was about to be invoked. A request that only waited for a turn is still
-        // `accepted` and runs after a stop or a crash, on either backend.
+        // `accepted` and runs after a stop, a closed intake, or a crash, on either backend.
         let permit = tokio::select! {
             biased;
-            () = self.stop() => return Step::Stop,
+            () = self.closing() => return Step::Stop,
             // The request was cancelled while it waited, which settled it, or an earlier write
             // had started it after all and it now has a turn to interrupt. The next head read
             // sees which.
@@ -708,6 +757,17 @@ impl Inner {
             // settlement is written and, if the store fails, retried.
             drop(permit);
             return self.settle(seq, Verdict::Interrupted).await;
+        }
+        // Intake can close while the start is being written. Nothing was invoked yet, so the
+        // request goes back to the queue for the next process on either backend.
+        if self.closed() {
+            drop(permit);
+            return match self.wiring.store.requeue(seq).await {
+                Ok(Requeued::Kept(_)) => self.settle(seq, Verdict::Interrupted).await,
+                Ok(Requeued::Requeued(_) | Requeued::AlreadyAccepted(_)) | Err(StoreFault) => {
+                    Step::Stop
+                }
+            };
         }
         let deadline =
             Instant::now() + Duration::from_secs(self.wiring.config.limits.model_turn_seconds);
@@ -949,7 +1009,7 @@ impl Inner {
         }
     }
 
-    /// Wait out the dead owner's lease. `false` when the service stopped first.
+    /// Wait out the dead owner's lease. `false` when intake closed first.
     async fn outlast(&self, orphan: &Orphan, refused_live: bool) -> bool {
         let remaining = orphan.lease_until() + LEASE_MARGIN - OffsetDateTime::now_utc();
         let mut wait = Duration::try_from(remaining).unwrap_or(Duration::ZERO);
@@ -958,7 +1018,7 @@ impl Inner {
         }
         tokio::select! {
             biased;
-            () = self.stop() => false,
+            () = self.closing() => false,
             () = tokio::time::sleep(wait) => true,
         }
     }
@@ -975,7 +1035,7 @@ impl Inner {
     ) -> Result<Result<Verdict, Unsettled>, Step> {
         let permit = tokio::select! {
             biased;
-            () = self.stop() => return Err(Step::Stop),
+            () = self.closing() => return Err(Step::Stop),
             // Nothing ran: read again and abandon instead.
             () = interrupt.wait() => return Ok(Err(Unsettled::Raced)),
             permit = self.wiring.permits.acquire() => permit,
@@ -1016,7 +1076,7 @@ impl Inner {
         if earlier > 0 {
             tokio::select! {
                 biased;
-                () = self.stop() => return Step::Stop,
+                () = self.closing() => return Step::Stop,
                 () = tokio::time::sleep(RETRY_SPACING) => {},
             }
         }
@@ -1159,7 +1219,8 @@ mod tests {
                 permits: TurnPermits::new(1),
                 config: Arc::new(config),
                 locals,
-                stop: stopped,
+                stop: stopped.clone(),
+                intake: stopped,
                 log,
             });
             let fixture = Self {

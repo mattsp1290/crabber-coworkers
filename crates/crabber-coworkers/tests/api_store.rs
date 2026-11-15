@@ -148,6 +148,21 @@ async fn second_open_is_in_use_until_every_handle_drops() {
 }
 
 #[tokio::test]
+async fn a_kept_lock_outlives_every_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = ApiStore::open(dir.path()).await.unwrap();
+    let clone = first.clone();
+    first.keep_lock_until_exit();
+    drop(first);
+    drop(clone);
+    // The lock stays with this process, which is the rest of this test binary's run.
+    assert!(matches!(
+        ApiStore::open(dir.path()).await,
+        Err(OpenError::InUse)
+    ));
+}
+
+#[tokio::test]
 async fn unknown_schema_version_or_foreign_file_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     drop(ApiStore::open(dir.path()).await.unwrap());

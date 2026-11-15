@@ -1,4 +1,5 @@
 use crate::{
+    api::{auth::ApiTokenSource, store::Faults},
     ask::{AskError, Cancel, Session, ask, validate_request},
     bridge, config,
     slack::{CredentialSource, api::DEFAULT_BASE},
@@ -30,7 +31,7 @@ pub enum Command {
         #[arg(long, default_value = "0.0.0.0:8090")]
         listen: std::net::SocketAddr,
     },
-    /// Answer Slack mentions for every coworker that has a slack block, until a signal arrives.
+    /// Serve Slack mentions and the HTTP API until a signal arrives.
     Serve {
         #[arg(long)]
         config: PathBuf,
@@ -63,13 +64,9 @@ pub enum Command {
 pub async fn run(cli: Cli) -> i32 {
     execute(
         cli,
-        Provider::FromEnv,
-        bridge::production_selection(),
-        None,
+        ServeOptions::from_env(),
         &mut io::stdout(),
         &mut io::stderr(),
-        CredentialSource::FromEnv,
-        DEFAULT_BASE,
     )
     .await
 }
@@ -84,15 +81,54 @@ pub async fn run_with(
 ) -> i32 {
     execute(
         cli,
-        Provider::Injected(resolver),
-        selection,
-        cancel,
+        ServeOptions {
+            provider: Provider::Injected(resolver),
+            selection,
+            cancel,
+            ..ServeOptions::from_env()
+        },
         out,
         err,
-        CredentialSource::FromEnv,
-        DEFAULT_BASE,
     )
     .await
+}
+
+/// Everything a command takes from outside its configuration file. [`ServeOptions::from_env`]
+/// is what the binary uses; an embedding test replaces fields to inject its own.
+pub struct ServeOptions {
+    pub provider: Provider,
+    pub selection: Selection,
+    /// `None` installs the process's signal handlers.
+    pub cancel: Option<Cancel>,
+    /// Renews `serve` when it resolves: intake closes, running turns finish, and `serve` exits
+    /// without starting another request. `None` installs the `USR1` handler.
+    pub renewal: Option<Cancel>,
+    pub credentials: CredentialSource,
+    pub api_token: ApiTokenSource,
+    /// Serve the HTTP API on this listener instead of binding `api.listen`.
+    pub api_listener: Option<tokio::net::TcpListener>,
+    pub slack_base: String,
+    #[doc(hidden)]
+    pub api_faults: Option<Arc<Faults>>,
+}
+
+impl ServeOptions {
+    /// Credentials and tokens from the environment, the production model, signal handlers, and
+    /// Slack's public API.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self {
+            provider: Provider::FromEnv,
+            selection: bridge::production_selection(),
+            cancel: None,
+            renewal: None,
+            credentials: CredentialSource::FromEnv,
+            api_token: ApiTokenSource::FromEnv,
+            api_listener: None,
+            slack_base: DEFAULT_BASE.into(),
+            api_faults: None,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -127,7 +163,8 @@ impl AppError {
     }
 }
 
-pub(crate) enum Provider {
+/// Where turns get their model, or the borb worker that runs them.
+pub enum Provider {
     FromEnv,
     Injected(Arc<dyn Resolver>),
     Remote(crate::execution::Remote),
@@ -143,16 +180,22 @@ impl Provider {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn execute(
+/// Boxed so that a caller's future need not prove `Send` through every type a command holds,
+/// which exceeds the default recursion limit of the crates that spawn it.
+fn execute<'a>(
     cli: Cli,
-    provider: Provider,
-    selection: Selection,
-    cancel: Option<Cancel>,
+    options: ServeOptions,
+    out: &'a mut (dyn Write + Send),
+    err: &'a mut (dyn Write + Send),
+) -> std::pin::Pin<Box<dyn Future<Output = i32> + Send + 'a>> {
+    Box::pin(command(cli, options, out, err))
+}
+
+async fn command(
+    cli: Cli,
+    options: ServeOptions,
     out: &mut (dyn Write + Send),
     err: &mut (dyn Write + Send),
-    credentials: CredentialSource,
-    slack_base: &str,
 ) -> i32 {
     if let Command::Worker {
         coworker_id,
@@ -160,7 +203,7 @@ async fn execute(
         listen,
     } = cli.command
     {
-        let cancel = if let Some(cancel) = cancel {
+        let cancel = if let Some(cancel) = options.cancel {
             cancel
         } else {
             let Ok(cancel) = install_cancel() else {
@@ -180,17 +223,7 @@ async fn execute(
         };
     }
     if let Command::Serve { config } = cli.command {
-        return match crate::serve::run(
-            config,
-            provider,
-            credentials,
-            selection,
-            cancel,
-            slack_base,
-            err,
-        )
-        .await
-        {
+        return match crate::serve::run(config, options, err).await {
             Ok(()) => 0,
             Err(error) => {
                 let _ = writeln!(err, "{error}");
@@ -207,7 +240,7 @@ async fn execute(
             }
         };
     }
-    match respond(cli, provider, selection, cancel)
+    match respond(cli, options.provider, options.selection, options.cancel)
         .await
         .and_then(|output| emit(out, &output))
     {
@@ -381,7 +414,24 @@ async fn list_conversations(state_dir: &std::path::Path, id: &str) -> Result<Str
     Ok(output)
 }
 
-/// Run the production serve dispatch with injected providers, tokens, base URL, and cancellation.
+/// Run the production `serve` dispatch with injected inputs. Returns the process exit code.
+pub async fn serve_with_options(
+    config: PathBuf,
+    options: ServeOptions,
+    err: &mut (dyn Write + Send),
+) -> i32 {
+    execute(
+        Cli {
+            command: Command::Serve { config },
+        },
+        options,
+        &mut Vec::new(),
+        err,
+    )
+    .await
+}
+
+/// [`serve_with_options`] with an injected model, Slack credentials, endpoint, and cancellation.
 pub async fn serve_with(
     config: PathBuf,
     resolver: Arc<dyn Resolver>,
@@ -391,22 +441,18 @@ pub async fn serve_with(
     slack_base: &str,
     err: &mut (dyn Write + Send),
 ) -> i32 {
-    execute(
-        Cli {
-            command: Command::Serve { config },
-        },
-        Provider::Injected(resolver),
+    let options = ServeOptions {
+        provider: Provider::Injected(resolver),
         selection,
-        Some(cancel),
-        &mut Vec::new(),
-        err,
+        cancel: Some(cancel),
         credentials,
-        slack_base,
-    )
-    .await
+        slack_base: slack_base.into(),
+        ..ServeOptions::from_env()
+    };
+    serve_with_options(config, options, err).await
 }
 
-/// Run Slack with a remote executor and injected Slack credentials and endpoint.
+/// [`serve_with_options`] with a remote executor and injected Slack credentials and endpoint.
 pub async fn serve_remote_with(
     config: PathBuf,
     remote: crate::execution::Remote,
@@ -415,17 +461,12 @@ pub async fn serve_remote_with(
     slack_base: &str,
     err: &mut (dyn Write + Send),
 ) -> i32 {
-    execute(
-        Cli {
-            command: Command::Serve { config },
-        },
-        Provider::Remote(remote),
-        bridge::production_selection(),
-        Some(cancel),
-        &mut Vec::new(),
-        err,
+    let options = ServeOptions {
+        provider: Provider::Remote(remote),
+        cancel: Some(cancel),
         credentials,
-        slack_base,
-    )
-    .await
+        slack_base: slack_base.into(),
+        ..ServeOptions::from_env()
+    };
+    serve_with_options(config, options, err).await
 }
