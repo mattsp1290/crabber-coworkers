@@ -6,8 +6,10 @@ use super::contract::{
     Acceptance, ApiUuid, ApiVersion, Cancellation, ConversationPhase, ConversationState,
     CoworkerId, FailureReason, RequestReceipt, RequestResult, RequestStatus,
 };
-use crate::store::{API_LOCK_FILE, API_STORE_FILE, create_private_file};
-use sha2::{Digest, Sha256};
+use crate::{
+    digest::sha256_hex,
+    store::{API_LOCK_FILE, API_STORE_FILE, create_private_file},
+};
 use sqlx::{
     ConnectOptions, Connection, Row, SqliteConnection, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow, SqliteSynchronous},
@@ -44,6 +46,7 @@ CREATE TABLE requests (
     reason              TEXT,
     result_text         TEXT,
     cancel_requested_at TEXT,
+    retirement_reason   TEXT,
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL,
     UNIQUE (conversation_id, request_id)
@@ -74,7 +77,7 @@ macro_rules! select_requests {
     ($tail:literal) => {
         concat!(
             "SELECT seq, conversation_id, request_id, text, text_sha256, status, reason, ",
-            "result_text, cancel_requested_at FROM requests ",
+            "result_text, cancel_requested_at, retirement_reason FROM requests ",
             $tail
         )
     };
@@ -136,6 +139,8 @@ enum Event {
     Start,
     Cancel(String),
     Finish(Outcome),
+    /// The request's turn was interrupted. What that settles as depends on the row.
+    Interrupt,
     Requeue,
 }
 
@@ -157,7 +162,19 @@ impl RequestState {
     /// event does not apply. A settled request never changes. `Cancelled` settles only a request
     /// whose cancellation was requested, so a cancelled receipt always carries its request time.
     /// An `accepted` request never ran, so `Failed` is the only outcome that can settle it.
-    fn after(&self, event: Event) -> Option<(Self, Option<String>)> {
+    ///
+    /// An interruption settles by what the row holds when it is applied: `uncertain` with the
+    /// `retirement` reason when reconciliation interrupted the run itself, else `cancelled` when
+    /// the client asked for that, else `failed` with `interrupted`.
+    fn after(
+        &self,
+        event: Event,
+        retirement: Option<FailureReason>,
+    ) -> Option<(Self, Option<String>)> {
+        let interrupted = |otherwise| {
+            let outcome = retirement.map_or(otherwise, Outcome::Uncertain);
+            Some((Self::Settled(outcome), None))
+        };
         match (self, event) {
             (Self::Accepted, Event::Start) => Some((Self::Running, None)),
             (Self::Accepted, Event::Cancel(at)) => {
@@ -168,7 +185,11 @@ impl RequestState {
             }
             (Self::Running, Event::Cancel(at)) => Some((Self::CancellationRequested, Some(at))),
             (Self::Running, Event::Requeue) => Some((Self::Accepted, None)),
-            (Self::Accepted, Event::Finish(_) | Event::Requeue)
+            (Self::Running, Event::Interrupt) => {
+                interrupted(Outcome::Failed(FailureReason::Interrupted))
+            }
+            (Self::CancellationRequested, Event::Interrupt) => interrupted(Outcome::Cancelled),
+            (Self::Accepted, Event::Finish(_) | Event::Interrupt | Event::Requeue)
             | (Self::Running, Event::Start | Event::Finish(Outcome::Cancelled))
             | (Self::CancellationRequested, Event::Start | Event::Cancel(_) | Event::Requeue)
             | (Self::Settled(_), _) => None,
@@ -231,6 +252,7 @@ pub struct RequestRow {
     text: String,
     state: RequestState,
     cancel_requested_at: Option<String>,
+    retirement: Option<FailureReason>,
 }
 
 impl fmt::Debug for RequestRow {
@@ -242,6 +264,7 @@ impl fmt::Debug for RequestRow {
             .field("text", &format_args!("<{} bytes>", self.text.len()))
             .field("state", &self.state)
             .field("cancel_requested_at", &self.cancel_requested_at)
+            .field("retirement", &self.retirement)
             .finish()
     }
 }
@@ -278,6 +301,13 @@ impl RequestRow {
         self.cancel_requested_at.as_deref()
     }
 
+    /// Why an interrupted run settles this request `uncertain`: reconciliation recorded the
+    /// reason before it made crabber interrupt the request's orphaned run.
+    #[must_use]
+    pub fn retirement(&self) -> Option<FailureReason> {
+        self.retirement
+    }
+
     #[must_use]
     pub fn into_receipt(self) -> RequestReceipt {
         RequestReceipt {
@@ -297,10 +327,13 @@ impl RequestRow {
     }
 
     fn after(&self, event: Event) -> Option<Self> {
-        let (state, requested_at) = self.state.after(event)?;
+        let (state, requested_at) = self.state.after(event, self.retirement)?;
+        // A request back in the queue was never admitted, so no run of it was ever retired.
+        let retirement = self.retirement.filter(|_| state != RequestState::Accepted);
         Some(Self {
             state,
             cancel_requested_at: self.cancel_requested_at.clone().or(requested_at),
+            retirement,
             ..self.clone()
         })
     }
@@ -349,6 +382,29 @@ pub enum Finished {
     Unchanged(RequestRow),
 }
 
+/// What [`ApiStore::begin_retirement`] found. Each variant carries the row as it now stands.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Retiring {
+    /// The request is `running` or `cancellation_requested` and carries this call's reason.
+    Recorded(RequestRow),
+    /// Nothing was written: the request is `accepted` or settled.
+    Kept(RequestRow),
+}
+
+/// What [`ApiStore::requeue`] did. Each variant carries the row as it now stands.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Requeued {
+    /// This call moved the request from `running` back to `accepted`.
+    Requeued(RequestRow),
+    /// An earlier call already requeued it, for example one whose commit landed after its time
+    /// bound fired.
+    AlreadyAccepted(RequestRow),
+    /// Nothing was written: a cancellation was requested, or the request is settled.
+    Kept(RequestRow),
+}
+
 /// One page of conversations in ascending ID order.
 #[derive(Debug)]
 pub struct ConversationRows {
@@ -370,7 +426,9 @@ pub struct SnapshotRows {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FaultPoint {
     MarkRunning,
+    /// Every settlement write: [`ApiStore::finish`] and [`ApiStore::interrupt`].
     Finish,
+    BeginRetirement,
     Ping,
 }
 
@@ -663,6 +721,7 @@ impl ApiStore {
                 text: text.to_owned(),
                 state: RequestState::Accepted,
                 cancel_requested_at: None,
+                retirement: None,
             }))
         })
         .await
@@ -761,6 +820,81 @@ impl ApiStore {
         .await
     }
 
+    /// Settle a request whose turn was interrupted, deciding inside one transaction what the
+    /// interruption was: `uncertain` with the recorded reason when reconciliation began retiring
+    /// the request's run ([`Self::begin_retirement`]), else `cancelled` when cancellation was
+    /// requested, else `failed` with `interrupted`. A cancellation that commits first is
+    /// therefore honoured, and one that commits afterwards finds the request settled. An
+    /// `accepted` or settled request returns [`Finished::Unchanged`].
+    ///
+    /// # Errors
+    /// [`StoreFault`] on a database failure or timeout, or when no request has this `seq`. The
+    /// attempt may or may not have committed.
+    pub async fn interrupt(&self, seq: Seq) -> Result<Finished, StoreFault> {
+        self.bounded(Some(FaultPoint::Finish), async {
+            let (row, changed) = self
+                .apply(Key::Seq(seq), Event::Interrupt)
+                .await?
+                .ok_or(StoreFault)?;
+            Ok(if changed {
+                Finished::Settled(row)
+            } else {
+                Finished::Unchanged(row)
+            })
+        })
+        .await
+    }
+
+    /// Record, before reconciliation makes crabber interrupt a request's orphaned run, why the
+    /// request then settles `uncertain`. Once the run is interrupted nothing in crabber says who
+    /// interrupted it, so this record is what keeps a later reconciliation from reading the
+    /// interruption as a graceful stop or as the client's cancellation. Only a `running` or
+    /// `cancellation_requested` request takes the record. A later reason replaces an earlier
+    /// one, because it is the latest reconciliation that interrupts the run.
+    ///
+    /// # Errors
+    /// [`StoreFault`] on a database failure or timeout, or when no request has this `seq`. The
+    /// attempt may or may not have committed.
+    pub async fn begin_retirement(
+        &self,
+        seq: Seq,
+        reason: FailureReason,
+    ) -> Result<Retiring, StoreFault> {
+        self.bounded(Some(FaultPoint::BeginRetirement), async {
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let found = sqlx::query(select_requests!("WHERE seq = ?"))
+                .bind(seq.0)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(StoreFault)?;
+            let row = decode_request(&found)?;
+            let started = matches!(
+                row.state,
+                RequestState::Running | RequestState::CancellationRequested
+            );
+            if !started || row.retirement == Some(reason) {
+                tx.rollback().await?;
+                return Ok(if started {
+                    Retiring::Recorded(row)
+                } else {
+                    Retiring::Kept(row)
+                });
+            }
+            sqlx::query("UPDATE requests SET retirement_reason = ?, updated_at = ? WHERE seq = ?")
+                .bind(reason.as_str())
+                .bind(now()?)
+                .bind(seq.0)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok(Retiring::Recorded(RequestRow {
+                retirement: Some(reason),
+                ..row
+            }))
+        })
+        .await
+    }
+
     /// `accepted` becomes `cancelled`, `running` becomes `cancellation_requested`, and any other
     /// state is returned unchanged. The first request time is kept. `None` for an unknown identity.
     ///
@@ -801,14 +935,24 @@ impl ApiStore {
         .await
     }
 
-    /// `running` returns to `accepted`, keeping its `seq`. Only reconciliation uses this.
+    /// `running` returns to `accepted`, keeping its `seq`. Only reconciliation uses this. A retry
+    /// after a [`StoreFault`] may find the request already requeued by the attempt that faulted,
+    /// and reports [`Requeued::AlreadyAccepted`].
     ///
     /// # Errors
-    /// [`StoreFault`] on a database failure or timeout.
-    pub async fn requeue(&self, seq: Seq) -> Result<bool, StoreFault> {
+    /// [`StoreFault`] on a database failure or timeout, or when no request has this `seq`. The
+    /// attempt may or may not have committed.
+    pub async fn requeue(&self, seq: Seq) -> Result<Requeued, StoreFault> {
         self.bounded(None, async {
-            let changed = self.apply(Key::Seq(seq), Event::Requeue).await?;
-            Ok(changed.is_some_and(|(_, changed)| changed))
+            let (row, changed) = self
+                .apply(Key::Seq(seq), Event::Requeue)
+                .await?
+                .ok_or(StoreFault)?;
+            Ok(match (changed, row.state()) {
+                (true, _) => Requeued::Requeued(row),
+                (false, RequestState::Accepted) => Requeued::AlreadyAccepted(row),
+                (false, _) => Requeued::Kept(row),
+            })
         })
         .await
     }
@@ -899,12 +1043,13 @@ impl ApiStore {
         };
         sqlx::query(
             "UPDATE requests SET status = ?, reason = ?, result_text = ?, cancel_requested_at = ?, \
-             updated_at = ? WHERE seq = ?",
+             retirement_reason = ?, updated_at = ? WHERE seq = ?",
         )
         .bind(next.state.status().as_str())
         .bind(next.state.reason().map(FailureReason::as_str))
         .bind(next.state.result())
         .bind(next.cancel_requested_at.as_deref())
+        .bind(next.retirement.map(FailureReason::as_str))
         .bind(now()?)
         .bind(next.seq.0)
         .execute(&mut *tx)
@@ -983,6 +1128,10 @@ fn decode_request(row: &SqliteRow) -> Result<RequestRow, StoreFault> {
     if !state.admits_cancellation(cancel_requested_at.is_some()) {
         return Err(StoreFault);
     }
+    let retirement = row
+        .try_get::<Option<&str>, _>("retirement_reason")?
+        .map(|reason| FailureReason::parse(reason).ok_or(StoreFault))
+        .transpose()?;
     Ok(RequestRow {
         seq: Seq(row.try_get("seq")?),
         conversation_id: uuid_column(row, "conversation_id")?,
@@ -990,6 +1139,7 @@ fn decode_request(row: &SqliteRow) -> Result<RequestRow, StoreFault> {
         text: row.try_get("text")?,
         state,
         cancel_requested_at,
+        retirement,
     })
 }
 
@@ -1024,13 +1174,4 @@ fn rfc3339(at: OffsetDateTime) -> Result<String, StoreFault> {
     at.to_offset(UtcOffset::UTC)
         .format(&Rfc3339)
         .map_err(|_| StoreFault)
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    Sha256::digest(bytes)
-        .iter()
-        .flat_map(|byte| [byte >> 4, byte & 0x0f])
-        .map(|nibble| char::from(DIGITS[usize::from(nibble)]))
-        .collect()
 }

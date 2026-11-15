@@ -11,8 +11,9 @@ use crate::{
         socket::{self, Inbound},
     },
     store,
+    turn::{self, Backend, BackendError, LocalError, LocalState, TurnPermits},
 };
-use crabber::{Selection, providers::Resolver, session::SqliteStore};
+use crabber::Selection;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::Write,
@@ -63,6 +64,23 @@ pub enum ServeError {
     Connection(String),
     #[error("interrupted")]
     Interrupted,
+}
+impl From<BackendError> for ServeError {
+    fn from(error: BackendError) -> Self {
+        match error {
+            BackendError::MissingApiKey => Self::MissingApiKey,
+            BackendError::Borb => Self::Borb,
+        }
+    }
+}
+impl From<LocalError> for ServeError {
+    fn from(error: LocalError) -> Self {
+        match error {
+            LocalError::Interrupted => Self::Interrupted,
+            LocalError::Workspace => Self::Workspace,
+            LocalError::Store(error) => Self::Store(error),
+        }
+    }
 }
 impl ServeError {
     #[must_use]
@@ -123,36 +141,9 @@ impl Drop for Supervisor {
     }
 }
 
-enum Backend {
-    Local {
-        resolver: Arc<dyn Resolver>,
-        selection: Selection,
-    },
-    Borb(crate::execution::Remote),
-}
-
-impl Backend {
-    fn new(config: &Config, provider: Provider, selection: Selection) -> Result<Self, ServeError> {
-        Ok(match (&config.borb, provider) {
-            (_, Provider::Remote(remote)) => Self::Borb(remote),
-            (Some(settings), Provider::FromEnv) => Self::Borb(
-                crate::execution::Remote::new(
-                    settings,
-                    std::env::var("BORB_TOKEN").map_err(|_| ServeError::Borb)?,
-                )
-                .map_err(|_| ServeError::Borb)?,
-            ),
-            (_, provider) => Self::Local {
-                resolver: provider.resolve().ok_or(ServeError::MissingApiKey)?,
-                selection,
-            },
-        })
-    }
-}
-
 struct Runtime {
-    backend: Backend,
-    permits: Semaphore,
+    backend: Arc<Backend>,
+    permits: TurnPermits,
     stop: Stop,
     log: Log,
     // A synchronous handler can spawn into this set without awaiting a lock.
@@ -171,36 +162,12 @@ impl Runtime {
     }
 }
 
-struct LocalState {
-    store: Arc<SqliteStore>,
-    workspace: crate::workspace::Workspace,
-}
-
-impl LocalState {
-    async fn open(config: &Config, index: usize, stop: &mut Cancel) -> Result<Self, ServeError> {
-        let def = &config.coworkers[index];
-        let deadline = Instant::now() + Duration::from_secs(config.limits.model_turn_seconds);
-        let workspace = crate::workspace::admit(def, &config.state_dir, deadline, stop)
-            .await
-            .map_err(|error| match error {
-                AskError::Interrupted => ServeError::Interrupted,
-                _ => ServeError::Workspace,
-            })?;
-        let store = tokio::select! {
-            biased;
-            () = &mut *stop => return Err(ServeError::Interrupted),
-            result = store::open(&config.state_dir, &def.id) => result?,
-        };
-        Ok(Self { store, workspace })
-    }
-}
-
 struct Coworker {
     config: Arc<Config>,
     index: usize,
     api: Arc<SlackApi>,
     identity: Identity,
-    local: Option<LocalState>,
+    local: Option<Arc<LocalState>>,
     runtime: Arc<Runtime>,
 }
 impl Coworker {
@@ -230,7 +197,7 @@ pub(crate) async fn run(
     if config.slack_coworkers().next().is_none() {
         return Err(ServeError::NoSlackCoworkers);
     }
-    let backend = Backend::new(&config, provider, selection)?;
+    let backend = Arc::new(Backend::new(&config, provider, selection)?);
     let tokens = config
         .coworkers
         .iter()
@@ -272,18 +239,15 @@ pub(crate) async fn run(
     let (log, mut logs) = mpsc::unbounded_channel();
     let runtime = Arc::new(Runtime {
         backend,
-        permits: Semaphore::new(config.limits.max_concurrent_turns),
+        permits: TurnPermits::new(config.limits.max_concurrent_turns),
         stop: stop.clone(),
         log,
         workers: Mutex::new(JoinSet::new()),
     });
+    let locals = turn::open_all(&config, &runtime.backend, &mut startup_stop).await?;
     let mut ready = Vec::new();
     for (index, api, identity, url) in authenticated {
-        let local = if matches!(runtime.backend, Backend::Local { .. }) {
-            Some(LocalState::open(&config, index, &mut startup_stop).await?)
-        } else {
-            None
-        };
+        let local = locals.get(&config.coworkers[index].id).cloned();
         ready.push((
             Arc::new(Coworker {
                 config: config.clone(),
@@ -615,11 +579,11 @@ async fn process_mention(coworker: &Coworker, name: &str, mention: &Mention) -> 
     let permit = tokio::select! {
         biased;
         () = &mut stop => return false,
-        result = coworker.runtime.permits.acquire() => result.expect("semaphore stays open"),
+        permit = coworker.runtime.permits.acquire() => permit,
     };
     let deadline = Instant::now() + Duration::from_secs(coworker.config.limits.model_turn_seconds);
     let def = &coworker.config.coworkers[coworker.index];
-    let answer = match &coworker.runtime.backend {
+    let answer = match coworker.runtime.backend.as_ref() {
         Backend::Local {
             resolver,
             selection,
@@ -702,23 +666,23 @@ mod tests {
         let (stop_tx, stop) = watch::channel(false);
         let (log, _) = mpsc::unbounded_channel();
         let runtime = Arc::new(Runtime {
-            backend: Backend::Local {
+            backend: Arc::new(Backend::Local {
                 resolver: provider.clone(),
                 selection: Selection {
                     provider_id: "fake".into(),
                     model_id: "scripted".into(),
                 },
-            },
-            permits: Semaphore::new(1),
+            }),
+            permits: TurnPermits::new(1),
             stop,
             log,
             workers: Mutex::new(JoinSet::new()),
         });
         let coworker = Arc::new(Coworker {
-            local: Some(LocalState {
+            local: Some(Arc::new(LocalState {
                 workspace: crate::workspace::Workspace::disabled(&config.coworkers[0]).unwrap(),
                 store: store::open(directory.path(), "scout").await.unwrap(),
-            }),
+            })),
             config: Arc::new(config),
             index: 0,
             api: Arc::new(
@@ -786,23 +750,23 @@ mod tests {
         let (stop_tx, stop) = watch::channel(false);
         let (log, _) = mpsc::unbounded_channel();
         let runtime = Arc::new(Runtime {
-            backend: Backend::Local {
+            backend: Arc::new(Backend::Local {
                 resolver: Arc::new(crabber::FakeProvider::scripted(vec![])),
                 selection: Selection {
                     provider_id: "fake".into(),
                     model_id: "scripted".into(),
                 },
-            },
-            permits: Semaphore::new(0),
+            }),
+            permits: TurnPermits::new(0),
             stop,
             log,
             workers: Mutex::new(JoinSet::new()),
         });
         let coworker = Arc::new(Coworker {
-            local: Some(LocalState {
+            local: Some(Arc::new(LocalState {
                 workspace: crate::workspace::Workspace::disabled(&config.coworkers[0]).unwrap(),
                 store: store::open(directory.path(), "scout").await.unwrap(),
-            }),
+            })),
             config: Arc::new(config),
             index: 0,
             api: Arc::new(
@@ -911,14 +875,14 @@ mod tests {
         let (stop_tx, stop) = watch::channel(false);
         let (log, mut logs) = mpsc::unbounded_channel();
         let runtime = Runtime {
-            backend: Backend::Local {
+            backend: Arc::new(Backend::Local {
                 resolver: Arc::new(crabber::FakeProvider::scripted(vec![])),
                 selection: Selection {
                     provider_id: "fake".into(),
                     model_id: "scripted".into(),
                 },
-            },
-            permits: Semaphore::new(1),
+            }),
+            permits: TurnPermits::new(1),
             stop,
             log,
             workers: Mutex::new(JoinSet::new()),
@@ -956,10 +920,14 @@ mod tests {
             2
         ]));
         let runtime = Arc::get_mut(&mut Arc::get_mut(&mut coworker).unwrap().runtime).unwrap();
-        if let Backend::Local { resolver, .. } = &mut runtime.backend {
-            *resolver = provider.clone();
-        }
-        runtime.permits.add_permits(1);
+        runtime.backend = Arc::new(Backend::Local {
+            resolver: provider.clone(),
+            selection: Selection {
+                provider_id: "fake".into(),
+                model_id: "scripted".into(),
+            },
+        });
+        runtime.permits = TurnPermits::new(1);
         let (sender, mut receiver) = mpsc::channel(THREAD_QUEUE);
         let slots = Arc::new(Semaphore::new(THREAD_QUEUE));
         for id in ["first", "second"] {

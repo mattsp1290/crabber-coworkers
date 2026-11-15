@@ -3,7 +3,7 @@ use crabber_coworkers::{
         contract::{ApiUuid, CoworkerId, FailureReason},
         store::{
             ApiStore, FaultPoint, Faults, Finished, MarkedRunning, OpenError, Opened, Outcome,
-            RequestRow, RequestState, StoreFault, Submitted,
+            RequestRow, RequestState, Requeued, Retiring, StoreFault, Submitted,
         },
     },
     store::{API_LOCK_FILE, API_STORE_FILE},
@@ -300,7 +300,21 @@ async fn settled_requests_never_change() {
             store.mark_running(row.seq()).await.unwrap(),
             MarkedRunning::Settled(settled.clone())
         );
-        assert!(!store.requeue(row.seq()).await.unwrap());
+        assert_eq!(
+            store.requeue(row.seq()).await.unwrap(),
+            Requeued::Kept(settled.clone())
+        );
+        assert_eq!(
+            store.interrupt(row.seq()).await.unwrap(),
+            Finished::Unchanged(settled.clone())
+        );
+        assert_eq!(
+            store
+                .begin_retirement(row.seq(), FailureReason::ProcessStopped)
+                .await
+                .unwrap(),
+            Retiring::Kept(settled.clone())
+        );
         assert_eq!(
             store
                 .request_cancel(id(1), id(request), at(9))
@@ -338,6 +352,164 @@ async fn finish_reports_an_outcome_that_does_not_apply_as_unchanged() {
     assert_eq!(running.state(), &RequestState::Running);
     assert_eq!(running.cancel_requested_at(), None);
     assert_eq!(store.request(id(1), id(10)).await.unwrap(), Some(running));
+}
+
+async fn retire(store: &ApiStore, row: &RequestRow, reason: FailureReason) -> RequestRow {
+    match store.begin_retirement(row.seq(), reason).await.unwrap() {
+        Retiring::Recorded(row) => row,
+        kept @ Retiring::Kept(_) => panic!("{kept:?}"),
+    }
+}
+
+async fn interrupt(store: &ApiStore, row: &RequestRow) -> RequestRow {
+    match store.interrupt(row.seq()).await.unwrap() {
+        Finished::Settled(row) => row,
+        unchanged @ Finished::Unchanged(_) => panic!("{unchanged:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_interruption_settles_by_what_the_request_holds() {
+    let (_dir, store) = opened().await;
+    let stopped = Outcome::Uncertain(FailureReason::ProcessStopped);
+
+    let queued = insert(&store, 1, 10, "q").await;
+    assert_eq!(
+        store.interrupt(queued.seq()).await.unwrap(),
+        Finished::Unchanged(queued)
+    );
+
+    let running = insert(&store, 1, 11, "q").await;
+    start(&store, &running).await;
+    let failed = interrupt(&store, &running).await;
+    assert_eq!(
+        failed.state(),
+        &RequestState::Settled(Outcome::Failed(FailureReason::Interrupted))
+    );
+    assert_eq!(failed.cancel_requested_at(), None);
+
+    let cancelling = insert(&store, 1, 12, "q").await;
+    start(&store, &cancelling).await;
+    store.request_cancel(id(1), id(12), at(1)).await.unwrap();
+    let cancelled = interrupt(&store, &cancelling).await;
+    assert_eq!(
+        cancelled.state(),
+        &RequestState::Settled(Outcome::Cancelled)
+    );
+    assert_eq!(
+        cancelled.cancel_requested_at(),
+        Some("2027-01-15T08:00:01Z")
+    );
+
+    // Reconciliation's own interruption of the run outranks a stop and a cancellation.
+    let retired = insert(&store, 1, 13, "q").await;
+    start(&store, &retired).await;
+    retire(&store, &retired, FailureReason::ProcessStopped).await;
+    let uncertain = interrupt(&store, &retired).await;
+    assert_eq!(uncertain.state(), &RequestState::Settled(stopped.clone()));
+
+    let both = insert(&store, 1, 14, "q").await;
+    start(&store, &both).await;
+    store.request_cancel(id(1), id(14), at(2)).await.unwrap();
+    retire(&store, &both, FailureReason::ProcessStopped).await;
+    let uncertain = interrupt(&store, &both).await;
+    assert_eq!(uncertain.state(), &RequestState::Settled(stopped));
+    assert_eq!(
+        uncertain.cancel_requested_at(),
+        Some("2027-01-15T08:00:02Z")
+    );
+    assert_eq!(
+        receipt(uncertain),
+        json!({
+            "apiVersion": "1",
+            "conversationId": id(1).to_string(),
+            "requestId": id(14).to_string(),
+            "acceptance": {"boundary": "sqlite_outbox"},
+            "status": "uncertain",
+            "reason": "process_stopped",
+            "cancellation": {"requestedAt": "2027-01-15T08:00:02Z"},
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_retirement_reason_is_recorded_only_for_a_started_request() {
+    let (_dir, store) = opened().await;
+    let row = insert(&store, 1, 10, "q").await;
+    assert_eq!(
+        store
+            .begin_retirement(row.seq(), FailureReason::ProcessStopped)
+            .await
+            .unwrap(),
+        Retiring::Kept(row.clone())
+    );
+    assert_eq!(row.retirement(), None);
+
+    let running = start(&store, &row).await;
+    let retiring = retire(&store, &row, FailureReason::ConfigurationChanged).await;
+    assert_eq!(retiring.state(), &RequestState::Running);
+    assert_eq!(
+        retiring.retirement(),
+        Some(FailureReason::ConfigurationChanged)
+    );
+    assert_eq!(
+        retire(&store, &row, FailureReason::ConfigurationChanged).await,
+        retiring
+    );
+    // The latest reconciliation is the one that interrupts the run, so its reason stands.
+    let replaced = retire(&store, &row, FailureReason::ProcessStopped).await;
+    assert_eq!(replaced.retirement(), Some(FailureReason::ProcessStopped));
+    assert_eq!(store.request(id(1), id(10)).await.unwrap(), Some(replaced));
+
+    // A request back in the queue was never admitted, so nothing of it was retired.
+    assert_eq!(
+        store.requeue(row.seq()).await.unwrap(),
+        Requeued::Requeued(row.clone())
+    );
+    assert_eq!(start(&store, &row).await, running);
+
+    // An explicit outcome settles a retiring request as given.
+    retire(&store, &row, FailureReason::ProcessStopped).await;
+    let done = finish(&store, &row, completed("answer")).await;
+    assert_eq!(done.state(), &RequestState::Settled(completed("answer")));
+    assert_eq!(receipt(done)["status"], "completed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_racing_an_interruption_is_honoured_or_finds_the_request_settled() {
+    let (_dir, store) = opened().await;
+    let mut races = JoinSet::new();
+    for request in 100..116 {
+        let row = insert(&store, 1, request, "q").await;
+        start(&store, &row).await;
+        let barrier = Arc::new(Barrier::new(2));
+        let (interrupting, cancelling) = (store.clone(), store.clone());
+        let (first, second) = (Arc::clone(&barrier), barrier);
+        races.spawn(async move {
+            first.wait().await;
+            // Whichever commits first, the interruption is what settles the request.
+            let interrupted = interrupting.interrupt(row.seq()).await.unwrap();
+            assert!(matches!(interrupted, Finished::Settled(_)));
+        });
+        races.spawn(async move {
+            second.wait().await;
+            cancelling
+                .request_cancel(id(1), id(request), at(0))
+                .await
+                .unwrap();
+        });
+    }
+    while let Some(raced) = races.join_next().await {
+        raced.unwrap();
+    }
+    for request in 100..116 {
+        let row = store.request(id(1), id(request)).await.unwrap().unwrap();
+        let expected = match row.cancel_requested_at() {
+            Some(_) => Outcome::Cancelled,
+            None => Outcome::Failed(FailureReason::Interrupted),
+        };
+        assert_eq!(row.state(), &RequestState::Settled(expected), "{request}");
+    }
 }
 
 #[tokio::test]
@@ -477,8 +649,11 @@ async fn next_work_returns_unsettled_requests_before_accepted_ones() {
         (newer.seq(), &RequestState::Running)
     );
     store.request_cancel(id(1), id(11), at(0)).await.unwrap();
-    assert!(!store.requeue(newer.seq()).await.unwrap());
     let head = store.next_work(id(1)).await.unwrap().unwrap();
+    assert_eq!(
+        store.requeue(newer.seq()).await.unwrap(),
+        Requeued::Kept(head.clone())
+    );
     assert_eq!(
         (head.seq(), head.state()),
         (newer.seq(), &RequestState::CancellationRequested)
@@ -487,8 +662,14 @@ async fn next_work_returns_unsettled_requests_before_accepted_ones() {
     assert_eq!(store.next_work(id(1)).await.unwrap(), Some(older.clone()));
 
     start(&store, &older).await;
-    assert!(store.requeue(older.seq()).await.unwrap());
-    assert!(!store.requeue(older.seq()).await.unwrap());
+    assert_eq!(
+        store.requeue(older.seq()).await.unwrap(),
+        Requeued::Requeued(older.clone())
+    );
+    assert_eq!(
+        store.requeue(older.seq()).await.unwrap(),
+        Requeued::AlreadyAccepted(older.clone())
+    );
     assert_eq!(store.next_work(id(1)).await.unwrap(), Some(older.clone()));
     settle(&store, &older, completed("a")).await;
     assert_eq!(store.next_work(id(1)).await.unwrap(), None);
@@ -662,12 +843,20 @@ async fn reopened_store_returns_every_row_unchanged() {
     start(&store, &running).await;
     start(&store, &pending).await;
     store.request_cancel(id(1), id(12), at(0)).await.unwrap();
+    retire(&store, &pending, FailureReason::ProcessStopped).await;
     settle(&store, &done, completed("answer")).await;
     let before = store.snapshot_rows(id(1), MAX).await.unwrap().rows;
     drop(store);
 
     let store = ApiStore::open(dir.path()).await.unwrap();
     assert_eq!(store.snapshot_rows(id(1), MAX).await.unwrap().rows, before);
+    assert_eq!(
+        before
+            .iter()
+            .map(RequestRow::retirement)
+            .collect::<Vec<_>>(),
+        [None, None, Some(FailureReason::ProcessStopped), None]
+    );
     assert_eq!(
         before
             .iter()
@@ -732,10 +921,18 @@ async fn faults_fail_or_delay_the_named_operation() {
     };
     assert_eq!(running.state(), &RequestState::Running);
 
-    faults.fail(FaultPoint::Finish, 4);
+    faults.fail(FaultPoint::BeginRetirement, 1);
+    let reason = FailureReason::ProcessStopped;
+    assert_eq!(store.begin_retirement(seq, reason).await, Err(StoreFault));
+    let unmarked = store.request(id(1), id(10)).await.unwrap().unwrap();
+    assert_eq!(unmarked.retirement(), None);
+
+    // Every settlement write shares one fault point.
+    faults.fail(FaultPoint::Finish, 5);
     for _ in 0..4 {
         assert_eq!(store.finish(seq, completed("a")).await, Err(StoreFault));
     }
+    assert_eq!(store.interrupt(seq).await, Err(StoreFault));
     assert_eq!(state().await, RequestState::Running);
     assert_eq!(
         finish(&store, &running, completed("a")).await.state(),
